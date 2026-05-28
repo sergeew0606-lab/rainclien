@@ -589,14 +589,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
 
     const updatedUser = {
-      ...users[user.username],
+      ...user,
       subscription: nextSubscription,
-      lastRewardAt: new Date().toISOString()
+      lastRewardAt: new Date().toISOString(),
+      rewardCount: (user.rewardCount || 0) + 1
     };
     
     users[user.username] = updatedUser;
     localStorage.setItem('rainclient_users', JSON.stringify(users));
     setUser(updatedUser);
+
+    import('firebase/database').then(({ ref, update }) => {
+      import('../utils/firebase').then(({ database }) => {
+        update(ref(database, `users/${user.username}`), {
+          subscription: nextSubscription,
+          lastRewardAt: updatedUser.lastRewardAt,
+          rewardCount: updatedUser.rewardCount
+        }).catch(err => console.error('Failed to update reward in firebase:', err));
+      }).catch(err => console.error('Failed to load firebase utils:', err));
+    }).catch(err => console.error('Failed to load firebase/database:', err));
   };
 
   return (

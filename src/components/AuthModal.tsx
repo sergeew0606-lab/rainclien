@@ -122,6 +122,8 @@ export default function AuthModal() {
         if (userData.hwid) firebaseData.hwid = userData.hwid;
         if (userData.key) firebaseData.key = userData.key;
         if (userData.email) firebaseData.email = userData.email;
+        if (userData.lastRewardAt) firebaseData.lastRewardAt = userData.lastRewardAt;
+        if (userData.rewardCount !== undefined) firebaseData.rewardCount = userData.rewardCount;
         firebaseData.twoFactor = Boolean(userData.twoFactor);
         if (userData.twoFactorSecret) firebaseData.twoFactorSecret = userData.twoFactorSecret;
 
