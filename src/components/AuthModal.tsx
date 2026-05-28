@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, User, Mail, Lock, Eye, EyeOff, Sparkles, CheckCircle2, AlertCircle } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { verifySync } from 'otplib';
 
 export default function AuthModal() {
   const { showAuth, setShowAuth, t, login, register, setPage } = useApp();
@@ -14,12 +15,36 @@ export default function AuthModal() {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [twoFactorCode, setTwoFactorCode] = useState('');
+  const [pendingLogin, setPendingLogin] = useState<{ username: string; password: string; firebaseData: any; secret: string } | null>(null);
 
   if (!showAuth) return null;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+
+    if (pendingLogin) {
+      if (!twoFactorCode.trim()) {
+        setError('Введите код 2FA');
+        return;
+      }
+      const verifyResult = verifySync({ token: twoFactorCode.trim(), secret: pendingLogin.secret }) as { valid?: boolean };
+      if (!verifyResult?.valid) {
+        setError('Неверный код 2FA');
+        return;
+      }
+      login(pendingLogin.username, pendingLogin.password, pendingLogin.firebaseData);
+      setSuccess(true);
+      setTimeout(() => {
+        setPage('profile');
+        setShowAuth(null);
+        setSuccess(false);
+        setPendingLogin(null);
+        setTwoFactorCode('');
+      }, 1200);
+      return;
+    }
 
     if (mode === 'register') {
       if (!username || !email || !password || !confirmPw) {
@@ -97,6 +122,8 @@ export default function AuthModal() {
         if (userData.hwid) firebaseData.hwid = userData.hwid;
         if (userData.key) firebaseData.key = userData.key;
         if (userData.email) firebaseData.email = userData.email;
+        firebaseData.twoFactor = Boolean(userData.twoFactor);
+        if (userData.twoFactorSecret) firebaseData.twoFactorSecret = userData.twoFactorSecret;
 
         // Use key data if available, otherwise use user's subscription data
         if (keyData) {
@@ -123,6 +150,18 @@ export default function AuthModal() {
           if (userData.valid_days) firebaseData.valid_days = userData.valid_days;
           if (userData.createdAt) firebaseData.createdAt = userData.createdAt;
           if (userData.activatedAt) firebaseData.activatedAt = userData.activatedAt;
+        }
+
+        if (userData.twoFactor && userData.twoFactorSecret) {
+          setPendingLogin({
+            username,
+            password,
+            firebaseData,
+            secret: userData.twoFactorSecret,
+          });
+          setTwoFactorCode('');
+          setLoading(false);
+          return;
         }
 
         login(username, password, firebaseData);
@@ -154,6 +193,8 @@ export default function AuthModal() {
   }
 
   const switchMode = () => {
+    setPendingLogin(null);
+    setTwoFactorCode('');
     setMode(mode === 'login' ? 'register' : 'login');
     setError('');
     setUsername('');
@@ -234,10 +275,11 @@ export default function AuthModal() {
                 </div>
 
                 <h2 className="text-2xl font-bold text-white text-center mb-2">
-                  {mode === 'login' ? t.auth.loginTitle : t.auth.registerTitle}
+                  {pendingLogin ? 'Подтвердите вход' : mode === 'login' ? t.auth.loginTitle : t.auth.registerTitle}
                 </h2>
 
                 {/* Tabs */}
+                {!pendingLogin && (
                 <div className="flex bg-white/5 rounded-xl p-1 mb-6">
                   <button
                     onClick={() => mode !== 'login' && switchMode()}
@@ -256,8 +298,27 @@ export default function AuthModal() {
                     {t.auth.register}
                   </button>
                 </div>
+                )}
 
                 <form onSubmit={handleSubmit} className="space-y-4">
+                  {pendingLogin ? (
+                    <div className="space-y-3">
+                      <p className="text-sm text-text-muted">Введите 6-значный код из приложения Google Authenticator / Authy</p>
+                      <div className="relative group">
+                        <Lock size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-text-muted group-focus-within:text-primary transition-colors" />
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={6}
+                          placeholder="000000"
+                          value={twoFactorCode}
+                          onChange={(e) => setTwoFactorCode(e.target.value.replace(/\D/g, ''))}
+                          className="w-full bg-white/5 border border-white/10 rounded-xl py-3 pl-11 pr-4 text-white text-sm placeholder-text-muted/60 focus:outline-none focus:border-primary/50 focus:bg-white/[0.07] transition-all duration-300"
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <>
                   {/* Username */}
                   <div className="relative group">
                     <User size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-text-muted group-focus-within:text-primary transition-colors" />
@@ -293,6 +354,8 @@ export default function AuthModal() {
                       </motion.div>
                     )}
                   </AnimatePresence>
+                    </>
+                  )}
 
                   {/* Password */}
                   <div className="relative group">

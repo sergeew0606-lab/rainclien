@@ -88,6 +88,8 @@ function pickPrize(): typeof PRIZES[0] {
 }
 
 const CARD_W = 140; // px width of each card
+const CARD_GAP = 12; // matches `gap-3`
+const CARD_STEP = CARD_W + CARD_GAP;
 const VISIBLE = 5;  // how many cards visible at once
 const CENTER_IDX = Math.floor(VISIBLE / 2);
 
@@ -126,7 +128,8 @@ export default function Roulette({ lastSpinAt, onWin }: RouletteProps) {
     setStrip(newStrip);
 
     // We want the winnerIdx card to be centered → offset = winnerIdx - CENTER_IDX
-    const targetOffset = (winnerIdx - CENTER_IDX) * CARD_W;
+    // Important: move by full card step (width + gap), otherwise visual winner and awarded prize can mismatch.
+    const targetOffset = (winnerIdx - CENTER_IDX) * CARD_STEP;
     setOffset(0); // reset
     setSpinning(true);
 
@@ -192,7 +195,7 @@ export default function Roulette({ lastSpinAt, onWin }: RouletteProps) {
         >
           <motion.div
             className="flex gap-3 absolute"
-            style={{ left: `calc(50% - ${CENTER_IDX * (CARD_W + 12)}px - ${CARD_W / 2}px)` }}
+            style={{ left: `calc(50% - ${CENTER_IDX * CARD_STEP}px - ${CARD_W / 2}px)` }}
             animate={{ x: -offset }}
             transition={spinning ? { duration: 3, ease: [0.2, 0.8, 0.4, 1] } : { duration: 0 }}
           >

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
   User, Shield, BarChart3, Settings, Cloud, Copy, Check,
@@ -10,12 +10,23 @@ import { useApp } from '../context/AppContext';
 import Roulette from './Roulette';
 
 export default function Profile() {
-  const { user, t, setPage, logout, setShowPurchase, downloadLoader, spinRoulette, applySubscriptionKey } = useApp();
+  const {
+    user, t, setPage, logout, setShowPurchase, downloadLoader, spinRoulette, applySubscriptionKey,
+    updateEmail, createTwoFactorSetup, enableTwoFactor, disableTwoFactor
+  } = useApp();
   const [copiedHwid, setCopiedHwid] = useState(false);
-  const [activeTab, setActiveTab] = useState<'info' | 'configs' | 'security' | 'stats'>('info');
+  const [activeTab, setActiveTab] = useState<'info' | 'security'>('info');
   const [subscriptionKey, setSubscriptionKey] = useState('');
   const [keyStatus, setKeyStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [keyLoading, setKeyLoading] = useState(false);
+  const [devices, setDevices] = useState<Array<{ id: string; name: string; date: string; active: boolean }>>([]);
+  const [emailInput, setEmailInput] = useState('');
+  const [emailLoading, setEmailLoading] = useState(false);
+  const [emailStatus, setEmailStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [twoFaCode, setTwoFaCode] = useState('');
+  const [twoFaLoading, setTwoFaLoading] = useState(false);
+  const [twoFaStatus, setTwoFaStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [twoFaSetup, setTwoFaSetup] = useState<{ secret: string; qrCodeUrl: string } | null>(null);
 
   if (!user) return null;
 
@@ -68,10 +79,54 @@ export default function Profile() {
 
   const tabs = [
     { id: 'info' as const, icon: <User size={18} />, label: t.profile.userInfo },
-    { id: 'stats' as const, icon: <BarChart3 size={18} />, label: t.profile.stats },
-    { id: 'configs' as const, icon: <Cloud size={18} />, label: t.profile.configs },
     { id: 'security' as const, icon: <Shield size={18} />, label: t.profile.security },
   ];
+
+  const getCurrentDeviceName = () => {
+    const ua = navigator.userAgent.toLowerCase();
+    const isWindows = ua.includes('windows');
+    const isMac = ua.includes('macintosh') || ua.includes('mac os');
+    const isAndroid = ua.includes('android');
+    const isIOS = ua.includes('iphone') || ua.includes('ipad');
+
+    let os = 'Unknown OS';
+    if (isWindows) os = 'Windows';
+    else if (isMac) os = 'macOS';
+    else if (isAndroid) os = 'Android';
+    else if (isIOS) os = 'iOS';
+
+    let browser = 'Browser';
+    if (ua.includes('edg')) browser = 'Edge';
+    else if (ua.includes('opr') || ua.includes('opera')) browser = 'Opera';
+    else if (ua.includes('chrome')) browser = 'Chrome';
+    else if (ua.includes('firefox')) browser = 'Firefox';
+    else if (ua.includes('safari')) browser = 'Safari';
+
+    return `${os} - ${browser}`;
+  };
+
+  useEffect(() => {
+    if (!user) return;
+    const key = `rainclient_devices_${user.username}`;
+    const nowIso = new Date().toISOString();
+    const currentDevice = { id: 'current-device', name: getCurrentDeviceName(), date: nowIso, active: true };
+
+    const saved = localStorage.getItem(key);
+    const parsed: Array<{ id: string; name: string; date: string; active: boolean }> = saved ? JSON.parse(saved) : [];
+
+    const withoutCurrent = parsed.filter((d) => d.id !== currentDevice.id).map((d) => ({ ...d, active: false }));
+    const nextDevices = [currentDevice, ...withoutCurrent]
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+      .slice(0, 6);
+
+    localStorage.setItem(key, JSON.stringify(nextDevices));
+    setDevices(nextDevices);
+  }, [user?.username]);
+
+  useEffect(() => {
+    if (!user) return;
+    setEmailInput(user.email || '');
+  }, [user?.email]);
 
   const containerVariants = {
     hidden: { opacity: 0 },
@@ -93,6 +148,46 @@ export default function Profile() {
     setKeyStatus({ type: result.ok ? 'success' : 'error', text: result.message });
     if (result.ok) setSubscriptionKey('');
     setKeyLoading(false);
+  };
+
+  const handleSaveEmail = async () => {
+    setEmailStatus(null);
+    setEmailLoading(true);
+    const result = await updateEmail(emailInput);
+    setEmailStatus({ type: result.ok ? 'success' : 'error', text: result.message });
+    setEmailLoading(false);
+  };
+
+  const handleToggleTwoFa = async () => {
+    setTwoFaStatus(null);
+    setTwoFaLoading(true);
+    if (user.twoFactor) {
+      const result = await disableTwoFactor();
+      setTwoFaStatus({ type: result.ok ? 'success' : 'error', text: result.message });
+      if (result.ok) setTwoFaSetup(null);
+    } else {
+      const setup = await createTwoFactorSetup();
+      if (setup.ok && setup.secret && setup.qrCodeUrl) {
+        setTwoFaSetup({ secret: setup.secret, qrCodeUrl: setup.qrCodeUrl });
+        setTwoFaStatus({ type: 'success', text: 'Отсканируйте QR и подтвердите кодом' });
+      } else {
+        setTwoFaStatus({ type: 'error', text: setup.message });
+      }
+    }
+    setTwoFaLoading(false);
+  };
+
+  const handleConfirmTwoFa = async () => {
+    if (!twoFaSetup) return;
+    setTwoFaStatus(null);
+    setTwoFaLoading(true);
+    const result = await enableTwoFactor(twoFaSetup.secret, twoFaCode);
+    setTwoFaStatus({ type: result.ok ? 'success' : 'error', text: result.message });
+    if (result.ok) {
+      setTwoFaSetup(null);
+      setTwoFaCode('');
+    }
+    setTwoFaLoading(false);
   };
 
   return (
@@ -253,9 +348,33 @@ export default function Profile() {
                 </h3>
                 <div className="space-y-4 relative z-10">
                   <InfoRow icon={<User size={16} />} label={t.profile.login} value={user.username} />
-                  <InfoRow icon={<Mail size={16} />} label={t.profile.email} value={user.email} />
+                  <InfoRow icon={<Mail size={16} />} label={t.profile.email} value={user.email || 'Не указана'} />
                   <InfoRow icon={<Hash size={16} />} label={t.profile.uid} value={`#${user.uid}`} />
                   <InfoRow icon={<Calendar size={16} />} label={t.profile.regDate} value={user.regDate} />
+                  <div className="pt-1">
+                    <p className="text-xs text-text-muted mb-2">{user.email ? 'Изменить почту' : 'Добавить почту'}</p>
+                    <div className="flex gap-2">
+                      <input
+                        type="email"
+                        value={emailInput}
+                        onChange={(e) => setEmailInput(e.target.value)}
+                        placeholder="example@mail.com"
+                        className="flex-1 bg-white/5 border border-white/10 rounded-xl py-2.5 px-3 text-white text-sm placeholder-text-muted/60 focus:outline-none focus:border-primary/50 transition-all"
+                      />
+                      <button
+                        onClick={handleSaveEmail}
+                        disabled={emailLoading}
+                        className="px-4 py-2.5 bg-primary/20 border border-primary/30 text-white text-sm rounded-xl disabled:opacity-60"
+                      >
+                        {emailLoading ? 'Сохранение...' : 'Сохранить'}
+                      </button>
+                    </div>
+                    {emailStatus && (
+                      <p className={`text-xs mt-2 ${emailStatus.type === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+                        {emailStatus.text}
+                      </p>
+                    )}
+                  </div>
                   <div className="flex items-center justify-between py-3 border-b border-white/5">
                     <div className="flex items-center gap-3 text-text-muted">
                       <Cpu size={16} />
@@ -470,162 +589,6 @@ export default function Profile() {
             </div>
           )}
 
-          {activeTab === 'stats' && (
-            <div className="grid md:grid-cols-3 gap-6">
-              <motion.div variants={itemVariants} className="gradient-border p-6 text-center md:col-span-3">
-                <h3 className="text-lg font-semibold text-white mb-8">{t.profile.stats}</h3>
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-6">
-                  <BigStat value="347" label="PvP Kills" icon={<Zap size={24} />} />
-                  <BigStat value="89%" label="Win Rate" icon={<Star size={24} />} />
-                  <BigStat value="1.2K" label="Blocks Placed" icon={<Settings size={24} />} />
-                  <BigStat value="56" label="Tournaments" icon={<Crown size={24} />} />
-                  <BigStat value="4.8" label="K/D Ratio" icon={<Activity size={24} />} />
-                </div>
-              </motion.div>
-
-              <motion.div variants={itemVariants} className="gradient-border p-6">
-                <h4 className="text-white font-semibold mb-4 flex items-center gap-2">
-                  <Shield size={16} className="text-primary" />
-                  Anti-Cheat Bypasses
-                </h4>
-                <div className="space-y-3">
-                  {[
-                    { name: 'Vulcan', pct: 99 },
-                    { name: 'Grim', pct: 97 },
-                    { name: 'Matrix', pct: 100 },
-                    { name: 'Polar', pct: 95 },
-                    { name: 'Intave', pct: 98 },
-                  ].map((ac) => (
-                    <div key={ac.name}>
-                      <div className="flex justify-between text-sm mb-1">
-                        <span className="text-text-muted">{ac.name}</span>
-                        <span className="text-green-400">{ac.pct}%</span>
-                      </div>
-                      <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
-                        <motion.div
-                          initial={{ width: 0 }}
-                          animate={{ width: `${ac.pct}%` }}
-                          transition={{ delay: 0.5, duration: 1 }}
-                          className="h-full bg-gradient-to-r from-green-500 to-emerald-400 rounded-full"
-                        />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </motion.div>
-
-              <motion.div variants={itemVariants} className="gradient-border p-6">
-                <h4 className="text-white font-semibold mb-4 flex items-center gap-2">
-                  <Activity size={16} className="text-primary" />
-                  Top Servers
-                </h4>
-                <div className="space-y-3">
-                  {[
-                    { name: 'mc.hypixel.net', hours: 89 },
-                    { name: 'funtime.su', hours: 45 },
-                    { name: 'mineblaze.net', hours: 32 },
-                    { name: 'vimeworld.com', hours: 21 },
-                    { name: 'mc.reallyworld.ru', hours: 15 },
-                  ].map((s, i) => (
-                    <div key={s.name} className="flex items-center justify-between py-2 border-b border-white/5 last:border-0">
-                      <div className="flex items-center gap-3">
-                        <span className="text-xs text-text-muted w-5">#{i + 1}</span>
-                        <span className="text-sm text-white">{s.name}</span>
-                      </div>
-                      <span className="text-xs text-text-muted">{s.hours}h</span>
-                    </div>
-                  ))}
-                </div>
-              </motion.div>
-
-              <motion.div variants={itemVariants} className="gradient-border p-6">
-                <h4 className="text-white font-semibold mb-4 flex items-center gap-2">
-                  <Clock size={16} className="text-primary" />
-                  {t.profile.lastSession}
-                </h4>
-                <div className="space-y-3">
-                  <InfoRow icon={<Calendar size={14} />} label="Date" value={user.stats.lastSession} />
-                  <InfoRow icon={<Clock size={14} />} label="Duration" value="2h 34m" />
-                  <InfoRow icon={<Star size={14} />} label="Server" value="mc.hypixel.net" />
-                  <InfoRow icon={<Zap size={14} />} label="Kills" value="23" />
-                  <InfoRow icon={<Shield size={14} />} label="Deaths" value="5" />
-                </div>
-              </motion.div>
-            </div>
-          )}
-
-          {activeTab === 'configs' && (
-            <div className="space-y-4">
-              {user.configs.length === 0 && (
-                <motion.div variants={itemVariants} className="gradient-border p-10 text-center">
-                  <Cloud size={48} className="text-text-muted mx-auto mb-4" />
-                  <p className="text-white font-semibold mb-2">Нет конфигов</p>
-                  <p className="text-text-muted text-sm">
-                    {hasSub ? 'Создайте свой первый конфиг' : 'Приобретите подписку для доступа к конфигам'}
-                  </p>
-                </motion.div>
-              )}
-              {user.configs.map((cfg, i) => (
-                <motion.div
-                  key={i}
-                  variants={itemVariants}
-                  className="gradient-border p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-4"
-                >
-                  <div className="flex items-center gap-4">
-                    <div className="w-12 h-12 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center">
-                      <Settings size={20} className="text-primary" />
-                    </div>
-                    <div>
-                      <p className="text-white font-semibold">{cfg.name}</p>
-                      <p className="text-text-muted text-sm flex items-center gap-2">
-                        <span>{cfg.server}</span>
-                        <span className="text-text-muted/40">·</span>
-                        <span>{cfg.date}</span>
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex gap-2 ml-auto">
-                    <motion.button
-                      whileHover={{ scale: 1.05 }}
-                      whileTap={{ scale: 0.95 }}
-                      className="p-2.5 bg-primary/10 border border-primary/20 rounded-xl text-primary-light hover:bg-primary/20 transition-colors"
-                      title={t.profile.configLoad}
-                    >
-                      <Download size={16} />
-                    </motion.button>
-                    <motion.button
-                      whileHover={{ scale: 1.05 }}
-                      whileTap={{ scale: 0.95 }}
-                      className="p-2.5 bg-white/5 border border-white/10 rounded-xl text-text-muted hover:text-white hover:bg-white/10 transition-colors"
-                      title={t.profile.configShare}
-                    >
-                      <Share2 size={16} />
-                    </motion.button>
-                    <motion.button
-                      whileHover={{ scale: 1.05 }}
-                      whileTap={{ scale: 0.95 }}
-                      className="p-2.5 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 hover:bg-red-500/20 transition-colors"
-                      title={t.profile.configDelete}
-                    >
-                      <Trash2 size={16} />
-                    </motion.button>
-                  </div>
-                </motion.div>
-              ))}
-
-              {hasSub && (
-                <motion.button
-                  variants={itemVariants}
-                  whileHover={{ scale: 1.01 }}
-                  className="w-full gradient-border p-5 text-center text-text-muted hover:text-white transition-colors flex items-center justify-center gap-2"
-                >
-                  <Cloud size={18} />
-                  + Создать конфиг
-                </motion.button>
-              )}
-            </div>
-          )}
-
           {activeTab === 'security' && (
             <div className="grid md:grid-cols-2 gap-6">
               <motion.div variants={itemVariants} className="gradient-border p-6">
@@ -673,13 +636,45 @@ export default function Profile() {
                       </span>
                     </div>
                     <motion.button
+                      onClick={handleToggleTwoFa}
+                      disabled={twoFaLoading}
                       whileHover={{ scale: 1.05 }}
                       whileTap={{ scale: 0.95 }}
-                      className="px-4 py-2 bg-primary/10 border border-primary/20 rounded-xl text-primary-light text-sm hover:bg-primary/20 transition-colors"
+                      className="px-4 py-2 bg-primary/10 border border-primary/20 rounded-xl text-primary-light text-sm hover:bg-primary/20 transition-colors disabled:opacity-60"
                     >
                       {user.twoFactor ? t.profile.disable : t.profile.enable}
                     </motion.button>
                   </div>
+                  {!user.twoFactor && twoFaSetup && (
+                    <div className="mt-4 bg-white/[0.02] border border-white/10 rounded-xl p-4">
+                      <p className="text-xs text-text-muted mb-3">1) Сканируйте QR в Google Authenticator / Authy</p>
+                      <img src={twoFaSetup.qrCodeUrl} alt="2FA QR" className="w-44 h-44 rounded-lg border border-white/10 mb-3" />
+                      <p className="text-xs text-text-muted mb-2">2) Введите код из приложения</p>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={6}
+                          value={twoFaCode}
+                          onChange={(e) => setTwoFaCode(e.target.value.replace(/\D/g, ''))}
+                          placeholder="000000"
+                          className="flex-1 bg-white/5 border border-white/10 rounded-xl py-2.5 px-3 text-white text-sm placeholder-text-muted/60 focus:outline-none focus:border-primary/50 transition-all"
+                        />
+                        <button
+                          onClick={handleConfirmTwoFa}
+                          disabled={twoFaLoading}
+                          className="px-4 py-2.5 bg-green-500/15 border border-green-500/30 text-green-300 text-sm rounded-xl disabled:opacity-60"
+                        >
+                          Подтвердить
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {twoFaStatus && (
+                    <p className={`text-xs mt-3 ${twoFaStatus.type === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+                      {twoFaStatus.text}
+                    </p>
+                  )}
                 </div>
 
                 <div className="gradient-border p-6">
@@ -688,16 +683,16 @@ export default function Profile() {
                     {t.profile.activeDevices}
                   </h3>
                   <div className="space-y-3">
-                    {[
-                      { name: 'Windows 11 — Chrome', date: 'Active now', active: true },
-                      { name: 'Windows 10 — Minecraft', date: '2 hours ago', active: false },
-                    ].map((d, i) => (
-                      <div key={i} className="flex items-center justify-between py-2 border-b border-white/5 last:border-0">
+                    {devices.length === 0 && (
+                      <p className="text-sm text-text-muted">Нет активных устройств</p>
+                    )}
+                    {devices.map((d, i) => (
+                      <div key={d.id} className="flex items-center justify-between py-2 border-b border-white/5 last:border-0">
                         <div className="flex items-center gap-3">
                           <Cpu size={16} className="text-text-muted" />
                           <div>
                             <p className="text-sm text-white">{d.name}</p>
-                            <p className="text-xs text-text-muted">{d.date}</p>
+                            <p className="text-xs text-text-muted">{d.active ? 'Active now' : new Date(d.date).toLocaleString('ru-RU')}</p>
                           </div>
                         </div>
                         {d.active ? (

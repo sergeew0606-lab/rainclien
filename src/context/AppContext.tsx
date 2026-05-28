@@ -1,5 +1,7 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { Lang, translations, Translations } from '../i18n';
+import { generateSecret, generateURI, verifySync } from 'otplib';
+import QRCode from 'qrcode';
 
 interface User {
   username: string;
@@ -20,6 +22,7 @@ interface User {
     lastSession: string;
   };
   twoFactor: boolean;
+  twoFactorSecret?: string;
   configs: any[];
   activity: number[];
   rewardCount: number;
@@ -34,6 +37,7 @@ interface AppContextType {
   login: (username: string, password: string, firebaseData?: any) => boolean;
   register: (username: string, email: string, password: string, firebaseData?: any) => boolean;
   logout: () => void;
+  updateEmail: (email: string) => Promise<{ ok: boolean; message: string }>;
   page: 'home' | 'profile';
   setPage: (p: 'home' | 'profile') => void;
   showAuth: 'login' | 'register' | null;
@@ -42,6 +46,9 @@ interface AppContextType {
   setShowPurchase: (v: boolean) => void;
   purchaseSubscription: (plan: 'month' | 'year' | 'lifetime') => void;
   applySubscriptionKey: (key: string) => Promise<{ ok: boolean; message: string }>;
+  createTwoFactorSetup: () => Promise<{ ok: boolean; message: string; secret?: string; qrCodeUrl?: string }>;
+  enableTwoFactor: (secret: string, code: string) => Promise<{ ok: boolean; message: string }>;
+  disableTwoFactor: () => Promise<{ ok: boolean; message: string }>;
   downloadLoader: () => void;
   spinRoulette: (days: number) => void;
 }
@@ -260,6 +267,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const email = firebaseData?.email || (users[username]?.email) || '';
     const rewardCount = firebaseData?.rewardCount ?? users[username]?.rewardCount ?? 0;
     const lastRewardAt = firebaseData?.lastRewardAt ?? users[username]?.lastRewardAt ?? '';
+    const twoFactor = Boolean(firebaseData?.twoFactor ?? users[username]?.twoFactor ?? false);
+    const twoFactorSecret = firebaseData?.twoFactorSecret ?? users[username]?.twoFactorSecret ?? '';
 
     if (users[username]) {
       users[username].hwid = hwid;
@@ -267,6 +276,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       users[username].subscription = subscription;
       users[username].rewardCount = rewardCount;
       users[username].lastRewardAt = lastRewardAt;
+      users[username].twoFactor = twoFactor;
+      users[username].twoFactorSecret = twoFactorSecret;
       localStorage.setItem('rainclient_users', JSON.stringify(users));
       setUser(users[username]);
       return true;
@@ -283,11 +294,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       regDate: now.toISOString().split('T')[0],
       subscription,
       stats: { sessions: 0, hoursPlayed: 0, configsSaved: 0, serversPlayed: 0, lastSession: '-' },
-      twoFactor: false,
+      twoFactor,
       configs: [],
       activity: Array.from({ length: 7 }, () => 0),
       rewardCount: 0,
-      lastRewardAt: ''
+      lastRewardAt: '',
+      twoFactorSecret,
     };
     users[username] = newUser;
     localStorage.setItem('rainclient_users', JSON.stringify(users));
@@ -316,7 +328,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       configs: [],
       activity: Array.from({ length: 7 }, () => 0),
       rewardCount: 0,
-      lastRewardAt: ''
+      lastRewardAt: '',
+      twoFactorSecret: '',
     };
     users[username] = newUser;
     localStorage.setItem('rainclient_users', JSON.stringify(users));
@@ -461,6 +474,95 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setPage('home');
   };
 
+  const updateEmail = async (emailRaw: string): Promise<{ ok: boolean; message: string }> => {
+    if (!user) return { ok: false, message: 'Сначала войдите в аккаунт' };
+    const email = emailRaw.trim();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) return { ok: false, message: 'Введите корректную почту' };
+
+    try {
+      const saved = localStorage.getItem('rainclient_users');
+      const users = saved ? JSON.parse(saved) : {};
+      const updatedUser = { ...users[user.username], email };
+      users[user.username] = updatedUser;
+      localStorage.setItem('rainclient_users', JSON.stringify(users));
+      setUser(updatedUser);
+
+      const { ref, update } = await import('firebase/database');
+      const { database } = await import('../utils/firebase');
+      await update(ref(database, `users/${user.username}`), { email });
+
+      return { ok: true, message: 'Почта сохранена' };
+    } catch (error: any) {
+      return { ok: false, message: error?.message || 'Ошибка сохранения почты' };
+    }
+  };
+
+  const createTwoFactorSetup = async (): Promise<{ ok: boolean; message: string; secret?: string; qrCodeUrl?: string }> => {
+    if (!user) return { ok: false, message: 'Сначала войдите в аккаунт' };
+    try {
+      const secret = generateSecret();
+      const service = 'RainClient';
+      const otpauth = generateURI({ issuer: service, label: user.username, secret });
+      const qrCodeUrl = await QRCode.toDataURL(otpauth);
+      return { ok: true, message: 'Сканируйте QR и введите код', secret, qrCodeUrl };
+    } catch (error: any) {
+      return { ok: false, message: error?.message || 'Не удалось создать 2FA' };
+    }
+  };
+
+  const enableTwoFactor = async (secretRaw: string, codeRaw: string): Promise<{ ok: boolean; message: string }> => {
+    if (!user) return { ok: false, message: 'Сначала войдите в аккаунт' };
+    const secret = secretRaw.trim();
+    const code = codeRaw.trim();
+    if (!secret || !code) return { ok: false, message: 'Введите код подтверждения' };
+    const verifyResult = verifySync({ token: code, secret }) as { valid?: boolean };
+    if (!verifyResult?.valid) return { ok: false, message: 'Неверный код 2FA' };
+
+    try {
+      const saved = localStorage.getItem('rainclient_users');
+      const users = saved ? JSON.parse(saved) : {};
+      const updatedUser = { ...users[user.username], twoFactor: true, twoFactorSecret: secret };
+      users[user.username] = updatedUser;
+      localStorage.setItem('rainclient_users', JSON.stringify(users));
+      setUser(updatedUser);
+
+      const { ref, update } = await import('firebase/database');
+      const { database } = await import('../utils/firebase');
+      await update(ref(database, `users/${user.username}`), {
+        twoFactor: true,
+        twoFactorSecret: secret,
+      });
+
+      return { ok: true, message: 'Двухфакторная аутентификация включена' };
+    } catch (error: any) {
+      return { ok: false, message: error?.message || 'Ошибка включения 2FA' };
+    }
+  };
+
+  const disableTwoFactor = async (): Promise<{ ok: boolean; message: string }> => {
+    if (!user) return { ok: false, message: 'Сначала войдите в аккаунт' };
+    try {
+      const saved = localStorage.getItem('rainclient_users');
+      const users = saved ? JSON.parse(saved) : {};
+      const updatedUser = { ...users[user.username], twoFactor: false, twoFactorSecret: '' };
+      users[user.username] = updatedUser;
+      localStorage.setItem('rainclient_users', JSON.stringify(users));
+      setUser(updatedUser);
+
+      const { ref, update } = await import('firebase/database');
+      const { database } = await import('../utils/firebase');
+      await update(ref(database, `users/${user.username}`), {
+        twoFactor: false,
+        twoFactorSecret: '',
+      });
+
+      return { ok: true, message: 'Двухфакторная аутентификация отключена' };
+    } catch (error: any) {
+      return { ok: false, message: error?.message || 'Ошибка отключения 2FA' };
+    }
+  };
+
   const spinRoulette = (days: number) => {
     if (!user) return;
     const saved = localStorage.getItem('rainclient_users');
@@ -499,10 +601,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   return (
     <AppContext.Provider value={{
-      lang, setLang, t, user, login, register, logout,
+      lang, setLang, t, user, login, register, logout, updateEmail,
       page, setPage, showAuth, setShowAuth,
       showPurchase, setShowPurchase, purchaseSubscription, downloadLoader,
-      applySubscriptionKey, spinRoulette
+      applySubscriptionKey, createTwoFactorSetup, enableTwoFactor, disableTwoFactor, spinRoulette
     }}>
       {children}
     </AppContext.Provider>
