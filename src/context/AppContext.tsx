@@ -402,10 +402,57 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const ensureLocalUserAccount = async (username: string): Promise<boolean> => {
+    const saved = localStorage.getItem('rainclient_users');
+    const users = saved ? JSON.parse(saved) : {};
+    if (users[username]) return true;
+
+    try {
+      const { ref, get, child } = await import('firebase/database');
+      const { database } = await import('../utils/firebase');
+      const snap = await get(child(ref(database), `users/${username}`));
+      if (!snap.exists()) return false;
+
+      const firebaseData = snap.val();
+      const subscription = normalizeSubscription(firebaseData);
+      const now = new Date();
+      users[username] = {
+        username,
+        email: firebaseData?.email || '',
+        hwid: firebaseData?.hwid || generateHWID(),
+        uid: firebaseData?.uid ?? getNextUID(),
+        regDate: firebaseData?.regDate || now.toISOString().split('T')[0],
+        subscription,
+        stats: firebaseData?.stats || {
+          sessions: 0,
+          hoursPlayed: 0,
+          configsSaved: 0,
+          serversPlayed: 0,
+          lastSession: '-',
+        },
+        twoFactor: Boolean(firebaseData?.twoFactor),
+        twoFactorSecret: firebaseData?.twoFactorSecret || '',
+        configs: firebaseData?.configs || [],
+        activity: firebaseData?.activity || Array.from({ length: 7 }, () => 0),
+        rewardCount: firebaseData?.rewardCount ?? 0,
+        lastRewardAt: firebaseData?.lastRewardAt ?? '',
+      };
+      localStorage.setItem('rainclient_users', JSON.stringify(users));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const grantSubscriptionToUser = async (
     username: string,
     plan: PurchasePlan
   ): Promise<{ ok: boolean; message: string }> => {
+    const hasAccount = await ensureLocalUserAccount(username);
+    if (!hasAccount) {
+      return { ok: false, message: 'Пользователь не найден. Войдите под тем же логином, что при покупке.' };
+    }
+
     const saved = localStorage.getItem('rainclient_users');
     const users = saved ? JSON.parse(saved) : {};
     if (!users[username]) {
@@ -482,12 +529,64 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return { ok: false, message: 'Не найдены данные покупки. Войдите и попробуйте снова.' };
     }
 
+    if (user?.username && username !== user.username) {
+      return {
+        ok: false,
+        message: `Этот платёж привязан к логину «${username}». Войдите под ним.`,
+      };
+    }
+
     const result = await grantSubscriptionToUser(username, plan);
     if (result.ok) {
       await markPaymentFulfilled(paymentId);
+      syncSessionFromStorage();
     }
     return result;
   };
+
+  // Оплачено на сервере, но вкладку закрыли — подтянуть подписку при входе
+  useEffect(() => {
+    if (!user) return;
+
+    void (async () => {
+      const paymentId = localStorage.getItem('pending_payment_id');
+      if (!paymentId) return;
+
+      const payment = await getPendingPayment(paymentId);
+      if (payment?.status === 'paid' && !payment?.fulfilled) {
+        await fulfillPaymentAfterSuccess(paymentId);
+        return;
+      }
+      if (payment?.fulfilled) {
+        localStorage.removeItem('pending_payment_id');
+        localStorage.removeItem('pending_purchase_plan');
+        localStorage.removeItem('pending_purchase_user');
+        syncSessionFromStorage();
+      }
+    })();
+
+    void (async () => {
+      try {
+        const { ref, get, child } = await import('firebase/database');
+        const { database } = await import('../utils/firebase');
+        const snap = await get(child(ref(database), `users/${user.username}`));
+        if (!snap.exists()) return;
+
+        const fbSub = normalizeSubscription(snap.val());
+        const localSub = user.subscription;
+        if (
+          fbSub.status === 'active' &&
+          (localSub.status !== 'active' ||
+            (fbSub.expiresAt !== localSub.expiresAt && fbSub.expiresAt !== '-'))
+        ) {
+          await persistUserSubscription(user.username, fbSub);
+        }
+      } catch {
+        // ignore sync errors
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- run when user session loads
+  }, [user?.username]);
 
   // Вкладка оплаты: ?payment=success → сразу выдача подписки
   useEffect(() => {

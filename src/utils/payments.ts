@@ -64,6 +64,15 @@ export async function waitForPaymentVerified(
   return false;
 }
 
+/** Подтянуть оплату по ID (если потеряли localStorage) */
+export async function recoverPaymentById(
+  paymentId: string
+): Promise<PendingPayment | null> {
+  const id = paymentId.trim().toUpperCase();
+  if (!/^RC-PAY-[A-Z0-9-]+$/.test(id)) return null;
+  return getPendingPayment(id);
+}
+
 export async function markPaymentFulfilled(paymentId: string): Promise<void> {
   try {
     const { ref, update } = await import('firebase/database');

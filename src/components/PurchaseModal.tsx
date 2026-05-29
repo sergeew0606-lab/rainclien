@@ -357,8 +357,9 @@ export default function PurchaseModal() {
       const failUrl = encodeURIComponent(
         `${window.location.origin}${window.location.pathname}?payment=fail&pid=${paymentId}`
       );
-      const label = encodeURIComponent(paymentLabel(paymentId));
-      const paymentUrl = `https://yoomoney.ru/quickpay/confirm.xml?receiver=${wallet}&quickpay-form=shop&targets=${label}&paymentType=AC&sum=${amount}&successURL=${returnUrl}&failURL=${failUrl}`;
+      const targets = encodeURIComponent(paymentLabel(paymentId));
+      const payLabel = encodeURIComponent(paymentId);
+      const paymentUrl = `https://yoomoney.ru/quickpay/confirm.xml?receiver=${wallet}&quickpay-form=shop&targets=${targets}&label=${payLabel}&paymentType=AC&sum=${amount}&successURL=${returnUrl}&failURL=${failUrl}`;
 
       setCheckingPayment(true);
       setPaymentFailed(false);

@@ -12,7 +12,7 @@ import Roulette from './Roulette';
 export default function Profile() {
   const {
     user, t, setPage, logout, setShowPurchase, downloadLoader, spinRoulette, applySubscriptionKey,
-    updateEmail, createTwoFactorSetup, enableTwoFactor, disableTwoFactor
+    updateEmail, createTwoFactorSetup, enableTwoFactor, disableTwoFactor, fulfillPaymentAfterSuccess,
   } = useApp();
   const [copiedHwid, setCopiedHwid] = useState(false);
   const [activeTab, setActiveTab] = useState<'info' | 'security'>('info');
@@ -27,6 +27,9 @@ export default function Profile() {
   const [twoFaLoading, setTwoFaLoading] = useState(false);
   const [twoFaStatus, setTwoFaStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [twoFaSetup, setTwoFaSetup] = useState<{ secret: string; qrCodeUrl: string } | null>(null);
+  const [recoverPaymentId, setRecoverPaymentId] = useState('');
+  const [recoverLoading, setRecoverLoading] = useState(false);
+  const [recoverStatus, setRecoverStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   if (!user) return null;
 
@@ -149,6 +152,53 @@ export default function Profile() {
     if (result.ok) setSubscriptionKey('');
     setKeyLoading(false);
   };
+
+  const handleRecoverPayment = async () => {
+    const id = recoverPaymentId.trim().toUpperCase();
+    if (!id) {
+      setRecoverStatus({ type: 'error', text: 'Введите номер заказа RC-PAY-…' });
+      return;
+    }
+    setRecoverStatus(null);
+    setRecoverLoading(true);
+    try {
+      const result = await fulfillPaymentAfterSuccess(id, { waitForVerificationMs: 180000 });
+      setRecoverStatus({ type: result.ok ? 'success' : 'error', text: result.message });
+      if (result.ok) setRecoverPaymentId('');
+    } finally {
+      setRecoverLoading(false);
+    }
+  };
+
+  const recoverPaymentBlock = (
+    <div className="mt-4 space-y-2 pt-4 border-t border-white/5">
+      <p className="text-xs text-text-muted">Оплатили, но подписка не появилась?</p>
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={recoverPaymentId}
+          onChange={(e) => setRecoverPaymentId(e.target.value)}
+          placeholder="RC-PAY-…"
+          className="flex-1 bg-white/5 border border-white/10 rounded-xl py-2.5 px-3 text-white text-sm placeholder-text-muted/60 focus:outline-none focus:border-green-500/40 transition-all"
+        />
+        <motion.button
+          type="button"
+          onClick={() => void handleRecoverPayment()}
+          disabled={recoverLoading}
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+          className="px-4 py-2.5 bg-green-500/15 border border-green-500/30 text-green-400 text-sm font-medium rounded-xl disabled:opacity-60"
+        >
+          {recoverLoading ? 'Проверка…' : 'Восстановить'}
+        </motion.button>
+      </div>
+      {recoverStatus && (
+        <p className={`text-xs ${recoverStatus.type === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+          {recoverStatus.text}
+        </p>
+      )}
+    </div>
+  );
 
   const handleSaveEmail = async () => {
     setEmailStatus(null);
@@ -501,6 +551,7 @@ export default function Profile() {
                           </p>
                         )}
                       </div>
+                      {recoverPaymentBlock}
                     </>
                   ) : (
                     <div className="text-center py-6">
@@ -544,6 +595,7 @@ export default function Profile() {
                           </p>
                         )}
                       </div>
+                      {recoverPaymentBlock}
                     </div>
                   )}
                 </div>
