@@ -6,7 +6,7 @@ import {
   Sparkles, Rocket, ChevronRight, Tag, Percent, BadgeCheck, XCircle
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import { createPendingPayment, paymentLabel } from '../utils/payments';
+import { createPendingPayment, paymentLabel, waitForPaymentVerified } from '../utils/payments';
 
 type Plan = 'month' | 'year' | 'lifetime';
 
@@ -114,6 +114,7 @@ export default function PurchaseModal() {
   const [promoChecking, setPromoChecking] = useState(false);
   const [paymentLink, setPaymentLink] = useState<string | null>(null);
   const [purchaseMessage, setPurchaseMessage] = useState('');
+  const [activatingPaid, setActivatingPaid] = useState(false);
 
   useEffect(() => {
     if (promoError) {
@@ -157,7 +158,9 @@ export default function PurchaseModal() {
 
       const params = new URLSearchParams(window.location.search);
       if (params.get('payment') === 'success') {
-        const result = await fulfillPaymentAfterSuccess(paymentId);
+        const result = await fulfillPaymentAfterSuccess(paymentId, {
+          waitForVerificationMs: 180000,
+        });
         if (cancelled) return;
         if (result.ok) {
           setPurchaseMessage(result.message);
@@ -191,6 +194,35 @@ export default function PurchaseModal() {
       window.removeEventListener('storage', onStorage);
     };
   }, [checkingPayment, fulfillPaymentAfterSuccess, setPage]);
+
+  // Ждём webhook ЮMoney → status paid → выдаём подписку автоматически
+  useEffect(() => {
+    if (!checkingPayment) return;
+
+    const paymentId = localStorage.getItem('pending_payment_id');
+    if (!paymentId) return;
+
+    let cancelled = false;
+
+    void (async () => {
+      const verified = await waitForPaymentVerified(paymentId, 600000);
+      if (cancelled || !verified) return;
+
+      const result = await fulfillPaymentAfterSuccess(paymentId);
+      if (cancelled || !result.ok) return;
+
+      setPurchaseMessage(result.message);
+      localStorage.setItem('pending_purchase_status', 'completed');
+      localStorage.removeItem('pending_payment_id');
+      localStorage.removeItem('pending_purchase_plan');
+      localStorage.removeItem('pending_purchase_user');
+      completePaymentOnThisTab();
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [checkingPayment, fulfillPaymentAfterSuccess]);
 
   // Already paid (e.g. reopened modal)
   useEffect(() => {
@@ -345,6 +377,33 @@ export default function PurchaseModal() {
     }
   };
 
+  const handleConfirmPaid = async () => {
+    const paymentId = localStorage.getItem('pending_payment_id');
+    if (!paymentId) {
+      alert('Сначала нажмите «Купить» и начните оплату.');
+      return;
+    }
+
+    setActivatingPaid(true);
+    try {
+      const result = await fulfillPaymentAfterSuccess(paymentId, {
+        waitForVerificationMs: 180000,
+      });
+      if (result.ok) {
+        setPurchaseMessage(result.message);
+        localStorage.setItem('pending_purchase_status', 'completed');
+        localStorage.removeItem('pending_payment_id');
+        localStorage.removeItem('pending_purchase_plan');
+        localStorage.removeItem('pending_purchase_user');
+        completePaymentOnThisTab();
+      } else {
+        alert(result.message);
+      }
+    } finally {
+      setActivatingPaid(false);
+    }
+  };
+
   const handleClose = () => {
     setShowPurchase(false);
     setSuccess(false);
@@ -436,14 +495,29 @@ export default function PurchaseModal() {
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   transition={{ delay: 0.5 }}
-                  className="flex items-center gap-2 text-blue-400 text-sm"
+                  className="flex flex-col items-center gap-4 w-full max-w-sm"
                 >
-                  <motion.div
-                    animate={{ opacity: [0.5, 1, 0.5] }}
-                    transition={{ duration: 1.5, repeat: Infinity }}
-                    className="w-2 h-2 bg-blue-400 rounded-full"
-                  />
-                  <span>Ожидаем оплату…</span>
+                  <div className="flex items-center gap-2 text-blue-400 text-sm">
+                    <motion.div
+                      animate={{ opacity: [0.5, 1, 0.5] }}
+                      transition={{ duration: 1.5, repeat: Infinity }}
+                      className="w-2 h-2 bg-blue-400 rounded-full"
+                    />
+                    <span>Ожидаем оплату…</span>
+                  </div>
+
+                  <p className="text-text-muted text-xs text-center">{t.purchase.iPaidHint}</p>
+
+                  <motion.button
+                    type="button"
+                    onClick={() => void handleConfirmPaid()}
+                    disabled={activatingPaid}
+                    whileHover={activatingPaid ? {} : { scale: 1.03 }}
+                    whileTap={activatingPaid ? {} : { scale: 0.97 }}
+                    className="w-full px-6 py-3.5 rounded-xl bg-gradient-to-r from-green-600/30 to-emerald-600/30 border border-green-500/40 text-green-300 font-semibold text-sm hover:from-green-600/40 disabled:opacity-50"
+                  >
+                    {activatingPaid ? t.purchase.activating : t.purchase.iPaid}
+                  </motion.button>
                 </motion.div>
               </motion.div>
             </div>
@@ -488,10 +562,26 @@ export default function PurchaseModal() {
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ delay: 0.6 }}
-                  className="text-text-muted text-center max-w-md mb-8"
+                  className="text-text-muted text-center max-w-md mb-4"
                 >
                   К сожалению, оплата не была завершена. Пожалуйста, попробуйте снова или выберите другой способ оплаты.
                 </motion.p>
+
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="flex flex-col items-center gap-3 mb-6 w-full max-w-sm"
+                >
+                  <p className="text-text-muted text-xs text-center">{t.purchase.iPaidHint}</p>
+                  <button
+                    type="button"
+                    onClick={() => void handleConfirmPaid()}
+                    disabled={activatingPaid}
+                    className="w-full px-6 py-3 rounded-xl bg-green-500/15 border border-green-500/30 text-green-400 font-semibold text-sm hover:bg-green-500/25 disabled:opacity-50"
+                  >
+                    {activatingPaid ? t.purchase.activating : t.purchase.iPaid}
+                  </button>
+                </motion.div>
 
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}

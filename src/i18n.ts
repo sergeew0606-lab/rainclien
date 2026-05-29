@@ -210,6 +210,9 @@ export const translations = {
       promoRemove: 'Убрать',
       oldPrice: 'Старая цена',
       newPrice: 'Итого',
+      iPaid: 'Я оплатил — проверить',
+      iPaidHint: 'После перевода ЮMoney подтверждает платёж (1–2 мин). Затем нажмите здесь.',
+      activating: 'Проверяем оплату…',
     },
   },
   en: {
@@ -421,6 +424,9 @@ export const translations = {
       promoRemove: 'Remove',
       oldPrice: 'Original price',
       newPrice: 'Total',
+      iPaid: 'I paid — verify',
+      iPaidHint: 'After payment YooMoney confirms it (1–2 min). Then click here.',
+      activating: 'Verifying payment…',
     },
   },
 } as const;

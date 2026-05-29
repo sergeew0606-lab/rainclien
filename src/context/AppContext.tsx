@@ -6,6 +6,7 @@ import {
   type PurchasePlan,
   getPendingPayment,
   markPaymentFulfilled,
+  waitForPaymentVerified,
 } from '../utils/payments';
 
 interface User {
@@ -50,7 +51,10 @@ interface AppContextType {
   showPurchase: boolean;
   setShowPurchase: (v: boolean) => void;
   purchaseSubscription: (plan: PurchasePlan) => Promise<void>;
-  fulfillPaymentAfterSuccess: (paymentId: string) => Promise<{ ok: boolean; message: string }>;
+  fulfillPaymentAfterSuccess: (
+    paymentId: string,
+    options?: { waitForVerificationMs?: number }
+  ) => Promise<{ ok: boolean; message: string }>;
   applySubscriptionKey: (key: string) => Promise<{ ok: boolean; message: string }>;
   createTwoFactorSetup: () => Promise<{ ok: boolean; message: string; secret?: string; qrCodeUrl?: string }>;
   enableTwoFactor: (secret: string, code: string) => Promise<{ ok: boolean; message: string }>;
@@ -430,13 +434,41 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  /** Сразу после успешного возврата с ЮMoney — выдаём подписку без ожидания webhook */
+  /** Выдача подписки только после подтверждения ЮMoney (webhook → status paid в Firebase) */
   const fulfillPaymentAfterSuccess = async (
-    paymentId: string
+    paymentId: string,
+    options?: { waitForVerificationMs?: number }
   ): Promise<{ ok: boolean; message: string }> => {
-    const payment = await getPendingPayment(paymentId);
+    let payment = await getPendingPayment(paymentId);
     if (payment?.fulfilled) {
       return { ok: true, message: 'Подписка уже активирована' };
+    }
+
+    if (payment?.status === 'failed') {
+      return {
+        ok: false,
+        message: 'Платёж не принят: неверная сумма или отмена. Проверьте сумму и комментарий к переводу.',
+      };
+    }
+
+    if (payment?.status !== 'paid') {
+      const waitMs = options?.waitForVerificationMs ?? 0;
+      if (waitMs > 0) {
+        const verified = await waitForPaymentVerified(paymentId, waitMs);
+        if (!verified) {
+          return {
+            ok: false,
+            message:
+              'ЮMoney ещё не подтвердил оплату. Подождите 1–2 минуты и нажмите «Я оплатил» снова. В комментарии к платежу должен быть номер заказа (RC-PAY-…).',
+          };
+        }
+        payment = await getPendingPayment(paymentId);
+      } else {
+        return {
+          ok: false,
+          message: 'Оплата ещё не подтверждена. Дождитесь зачисления на кошелёк или нажмите «Я оплатил».',
+        };
+      }
     }
 
     const plan = (payment?.plan ||
@@ -493,7 +525,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     void (async () => {
       setShowPurchase(true);
-      const result = await fulfillPaymentAfterSuccess(paymentId);
+      const result = await fulfillPaymentAfterSuccess(paymentId, {
+        waitForVerificationMs: 180000,
+      });
       localStorage.removeItem('pending_payment_id');
       localStorage.removeItem('pending_purchase_plan');
       localStorage.removeItem('pending_purchase_user');
