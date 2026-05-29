@@ -62,6 +62,31 @@ function parsePromoFromDb(
   return { ok: false };
 }
 
+async function loadPromoFromFirebase(code: string) {
+  const { ref, get, child } = await import('firebase/database');
+  const { database } = await import('../utils/firebase');
+  const dbRef = ref(database);
+  const trimmed = code.trim();
+  if (!trimmed) return null;
+
+  const variants = [...new Set([trimmed, trimmed.toUpperCase(), trimmed.toLowerCase()])];
+  for (const key of variants) {
+    const snapshot = await get(child(dbRef, `promos/${key}`));
+    if (snapshot.exists()) {
+      return { raw: snapshot.val(), displayCode: key.toUpperCase() };
+    }
+  }
+
+  const allSnap = await get(child(dbRef, 'promos'));
+  if (!allSnap.exists()) return null;
+
+  const promos = allSnap.val() as Record<string, unknown>;
+  const matchKey = Object.keys(promos).find((k) => k.toLowerCase() === trimmed.toLowerCase());
+  if (!matchKey) return null;
+
+  return { raw: promos[matchKey], displayCode: matchKey.toUpperCase() };
+}
+
 const BASE_PRICES: Record<Plan, number> = {
   month: 170,
   year: 250,
@@ -140,19 +165,15 @@ export default function PurchaseModal() {
 
     setPromoChecking(true);
     try {
-      const { ref, get, child } = await import('firebase/database');
-      const { database } = await import('../utils/firebase');
-      const codeKey = trimmed.toUpperCase();
-      const snapshot = await get(child(ref(database), `promos/${codeKey}`));
-
-      if (!snapshot.exists()) {
+      const loaded = await loadPromoFromFirebase(trimmed);
+      if (!loaded) {
         setPromoError(true);
         setPromoSuccess(false);
         setAppliedPromo(null);
         return;
       }
 
-      const parsed = parsePromoFromDb(snapshot.val(), codeKey);
+      const parsed = parsePromoFromDb(loaded.raw, loaded.displayCode);
       if (!parsed.ok) {
         setPromoError(true);
         setPromoSuccess(false);
