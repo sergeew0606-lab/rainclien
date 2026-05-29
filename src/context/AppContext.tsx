@@ -2,6 +2,12 @@ import { createContext, useContext, useState, useEffect, ReactNode } from 'react
 import { Lang, translations, Translations } from '../i18n';
 import { generateSecret, generateURI, verifySync } from 'otplib';
 import QRCode from 'qrcode';
+import {
+  type PurchasePlan,
+  getPendingPayment,
+  markPaymentFulfilled,
+  waitForPaymentVerified,
+} from '../utils/payments';
 
 interface User {
   username: string;
@@ -44,7 +50,8 @@ interface AppContextType {
   setShowAuth: (v: 'login' | 'register' | null) => void;
   showPurchase: boolean;
   setShowPurchase: (v: boolean) => void;
-  purchaseSubscription: (plan: 'month' | 'year' | 'lifetime') => Promise<void>;
+  purchaseSubscription: (plan: PurchasePlan) => Promise<void>;
+  completeVerifiedPayment: (paymentId: string) => Promise<{ ok: boolean; message: string }>;
   applySubscriptionKey: (key: string) => Promise<{ ok: boolean; message: string }>;
   createTwoFactorSetup: () => Promise<{ ok: boolean; message: string; secret?: string; qrCodeUrl?: string }>;
   enableTwoFactor: (secret: string, code: string) => Promise<{ ok: boolean; message: string }>;
@@ -165,29 +172,36 @@ function inferPlanFromDays(days: number): string {
   return 'week';
 }
 
-type PurchasePlan = 'month' | 'year' | 'lifetime';
+/** Навсегда = до 31.01.2038 */
+export const LIFETIME_EXPIRES_AT = '2038-01-31T23:59:59.999Z';
 
-function buildSubscriptionForPurchase(
-  plan: PurchasePlan,
-  current: User['subscription']
-): User['subscription'] {
-  if (plan === 'lifetime') {
-    return { plan: 'lifetime', status: 'active', expiresAt: '∞' };
-  }
+export type { PurchasePlan };
 
-  const currentExpiry = current.expiresAt !== '-' && current.expiresAt !== '∞'
-    ? new Date(current.expiresAt)
-    : new Date();
-  const isExpired = currentExpiry.getTime() < Date.now();
-  const baseDate = isExpired ? new Date() : currentExpiry;
+function generatePurchaseKeyCode(): string {
+  const chunk = () => Math.random().toString(36).slice(2, 6).toUpperCase();
+  return `RC-${Date.now().toString(36).toUpperCase()}-${chunk()}${chunk()}`;
+}
 
-  if (plan === 'month') {
-    baseDate.setDate(baseDate.getDate() + 30);
-  } else if (plan === 'year') {
-    baseDate.setDate(baseDate.getDate() + 180);
-  }
-
-  return { plan, status: 'active', expiresAt: baseDate.toISOString() };
+async function createPurchaseKeyInFirebase(
+  plan: 'month' | 'year',
+  username: string
+): Promise<string> {
+  const { ref, set } = await import('firebase/database');
+  const { database } = await import('../utils/firebase');
+  const days = plan === 'month' ? 30 : 365;
+  const key = generatePurchaseKeyCode();
+  await set(ref(database, `keys/${key}`), {
+    days,
+    durationDays: days,
+    plan,
+    createdAt: new Date().toISOString(),
+    createdFor: username,
+    paymentType: 'purchase',
+    isUsed: false,
+    used: false,
+    activated: false,
+  });
+  return key;
 }
 
 function normalizeSubscription(firebaseData?: any): User['subscription'] {
@@ -264,16 +278,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
   };
 
-  const grantSubscriptionToUser = async (username: string, plan: PurchasePlan): Promise<boolean> => {
+  const persistUserSubscription = async (
+    username: string,
+    subscription: User['subscription'],
+    extraFirebase?: Record<string, unknown>
+  ) => {
     const saved = localStorage.getItem('rainclient_users');
     const users = saved ? JSON.parse(saved) : {};
     const account = users[username];
-    if (!account) return false;
+    if (!account) return;
 
-    const subscription = buildSubscriptionForPurchase(
-      plan,
-      account.subscription || { plan: 'none', status: 'none', expiresAt: '-' }
-    );
     const updatedUser = { ...account, subscription };
     users[username] = updatedUser;
     localStorage.setItem('rainclient_users', JSON.stringify(users));
@@ -292,17 +306,153 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const { database } = await import('../utils/firebase');
       await update(ref(database, `users/${username}`), {
         subscription,
-        paidAt: new Date().toISOString(),
-        lastPurchasePlan: plan,
+        updatedAt: new Date().toISOString(),
+        ...extraFirebase,
       });
     } catch (err) {
-      console.error('Failed to sync subscription to Firebase:', err);
+      console.error('Failed to sync user to Firebase:', err);
     }
-
-    return true;
   };
 
-  // Payment tab returns here — activate and notify the main tab
+  const activateSubscriptionKeyForUser = async (
+    username: string,
+    key: string
+  ): Promise<{ ok: boolean; message: string }> => {
+    const saved = localStorage.getItem('rainclient_users');
+    const users = saved ? JSON.parse(saved) : {};
+    if (!users[username]) return { ok: false, message: 'Пользователь не найден' };
+
+    try {
+      const { ref, get, child, update } = await import('firebase/database');
+      const { database } = await import('../utils/firebase');
+      const dbRef = ref(database);
+      const keySnapshot = await get(child(dbRef, `keys/${key}`));
+      if (!keySnapshot.exists()) {
+        return { ok: false, message: 'Неизвестный ключ' };
+      }
+
+      const keyData = keySnapshot.val();
+      const activatedBy = keyData?.activatedBy || keyData?.usedBy || keyData?.owner;
+      const alreadyUsed = Boolean(
+        keyData?.isUsed ||
+        keyData?.used ||
+        keyData?.activated ||
+        (activatedBy && activatedBy !== username)
+      );
+      if (alreadyUsed && activatedBy !== username) {
+        return { ok: false, message: 'Ключ уже активирован другим пользователем' };
+      }
+
+      const currentSub: User['subscription'] =
+        users[username].subscription || { plan: 'none', status: 'none', expiresAt: '-' };
+      const { days, plan: keyPlan } = resolveKeyDaysAndPlan(keyData);
+      if (keyPlan === 'none' && days === null) {
+        return { ok: false, message: 'У ключа нет срока подписки' };
+      }
+
+      let nextPlan = keyPlan;
+      let nextExpiresAt = currentSub.expiresAt;
+      if (keyPlan === 'lifetime') {
+        nextExpiresAt = LIFETIME_EXPIRES_AT;
+      } else {
+        const extendDays = days || 0;
+        const currentExpiry =
+          currentSub.expiresAt !== '-' && currentSub.expiresAt !== '∞'
+            ? new Date(currentSub.expiresAt)
+            : new Date();
+        const baseDate = currentExpiry.getTime() > Date.now() ? currentExpiry : new Date();
+        baseDate.setDate(baseDate.getDate() + extendDays);
+        nextExpiresAt = baseDate.toISOString();
+        if (!nextPlan || nextPlan === 'none') {
+          nextPlan = normalizePlanName(currentSub.plan, extendDays) || 'month';
+        }
+      }
+
+      const nextSubscription: User['subscription'] = {
+        plan: nextPlan === 'none' ? currentSub.plan : nextPlan,
+        status: 'active',
+        expiresAt: nextExpiresAt,
+      };
+
+      await persistUserSubscription(username, nextSubscription, {
+        key,
+        activatedAt: new Date().toISOString(),
+        paidAt: new Date().toISOString(),
+      });
+
+      await update(ref(database, `keys/${key}`), {
+        isUsed: true,
+        used: true,
+        activated: true,
+        activatedBy: username,
+        activatedAt: new Date().toISOString(),
+      });
+
+      const successMessage =
+        keyPlan === 'lifetime'
+          ? `Ключ ${key}: подписка до 31.01.2038`
+          : `Ключ ${key}: +${days} дн., активирован`;
+      return { ok: true, message: successMessage };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Ошибка активации ключа';
+      return { ok: false, message };
+    }
+  };
+
+  const grantSubscriptionToUser = async (
+    username: string,
+    plan: PurchasePlan
+  ): Promise<{ ok: boolean; message: string }> => {
+    const saved = localStorage.getItem('rainclient_users');
+    const users = saved ? JSON.parse(saved) : {};
+    if (!users[username]) {
+      return { ok: false, message: 'Пользователь не найден' };
+    }
+
+    try {
+      if (plan === 'lifetime') {
+        const subscription: User['subscription'] = {
+          plan: 'lifetime',
+          status: 'active',
+          expiresAt: LIFETIME_EXPIRES_AT,
+        };
+        await persistUserSubscription(username, subscription, {
+          paidAt: new Date().toISOString(),
+          lastPurchasePlan: plan,
+        });
+        return { ok: true, message: 'Подписка «Навсегда» до 31.01.2038' };
+      }
+
+      const key = await createPurchaseKeyInFirebase(plan, username);
+      return activateSubscriptionKeyForUser(username, key);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Ошибка выдачи подписки';
+      return { ok: false, message };
+    }
+  };
+
+  const completeVerifiedPayment = async (
+    paymentId: string
+  ): Promise<{ ok: boolean; message: string }> => {
+    const payment = await getPendingPayment(paymentId);
+    if (!payment || payment.status !== 'paid') {
+      return {
+        ok: false,
+        message: 'Оплата не подтверждена. Дождитесь зачисления или напишите в поддержку.',
+      };
+    }
+    if (payment.fulfilled) {
+      return { ok: true, message: 'Подписка уже активирована' };
+    }
+
+    const result = await grantSubscriptionToUser(payment.username, payment.plan);
+    if (result.ok) {
+      await markPaymentFulfilled(paymentId);
+    }
+    return result;
+  };
+
+  // Payment tab: only after ЮMoney webhook marked payment as paid
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const paymentStatus = urlParams.get('payment');
@@ -320,6 +470,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     };
 
     if (paymentStatus === 'fail') {
+      localStorage.removeItem('pending_payment_id');
       localStorage.removeItem('pending_purchase_plan');
       localStorage.removeItem('pending_purchase_user');
       finishPaymentUi(false);
@@ -328,29 +479,29 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     if (paymentStatus !== 'success') return;
 
-    const pendingPlan = localStorage.getItem('pending_purchase_plan') as PurchasePlan | null;
-    if (!pendingPlan) {
-      finishPaymentUi(false);
-      return;
-    }
-
-    const savedUser = localStorage.getItem('rainclient_user');
-    const parsedUser = savedUser ? JSON.parse(savedUser) : null;
-    const username =
-      localStorage.getItem('pending_purchase_user') ||
-      parsedUser?.username ||
-      user?.username;
-
-    if (!username) {
+    const paymentId =
+      urlParams.get('pid') || localStorage.getItem('pending_payment_id');
+    if (!paymentId) {
       finishPaymentUi(false);
       return;
     }
 
     void (async () => {
-      const ok = await grantSubscriptionToUser(username, pendingPlan);
+      setShowPurchase(true);
+      const verified = await waitForPaymentVerified(paymentId);
+      if (!verified) {
+        localStorage.removeItem('pending_payment_id');
+        localStorage.removeItem('pending_purchase_plan');
+        localStorage.removeItem('pending_purchase_user');
+        finishPaymentUi(false);
+        return;
+      }
+
+      const result = await completeVerifiedPayment(paymentId);
+      localStorage.removeItem('pending_payment_id');
       localStorage.removeItem('pending_purchase_plan');
       localStorage.removeItem('pending_purchase_user');
-      finishPaymentUi(ok);
+      finishPaymentUi(result.ok);
     })();
   // eslint-disable-next-line react-hooks/exhaustive-deps -- run once when returning from payment URL
   }, []);
@@ -461,87 +612,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!user) return { ok: false, message: 'Сначала войдите в аккаунт' };
     const key = keyRaw.trim();
     if (!key) return { ok: false, message: 'Введите ключ' };
-
-    try {
-      const { ref, get, child, update } = await import('firebase/database');
-      const { database } = await import('../utils/firebase');
-      const dbRef = ref(database);
-      const keySnapshot = await get(child(dbRef, `keys/${key}`));
-      if (!keySnapshot.exists()) {
-        return { ok: false, message: 'Неизвестный ключ' };
-      }
-
-      const keyData = keySnapshot.val();
-      const activatedBy = keyData?.activatedBy || keyData?.usedBy || keyData?.owner;
-      const alreadyUsed = Boolean(
-        keyData?.isUsed ||
-        keyData?.used ||
-        keyData?.activated ||
-        (activatedBy && activatedBy !== user.username)
-      );
-      if (alreadyUsed && activatedBy !== user.username) {
-        return { ok: false, message: 'он был уже активированом' };
-      }
-      const { days, plan } = resolveKeyDaysAndPlan(keyData);
-      if (plan === 'none' && days === null) {
-        return { ok: false, message: 'Ключ найден, но у него нет срока подписки' };
-      }
-
-      let nextPlan = plan;
-      let nextExpiresAt = user.subscription.expiresAt;
-      if (plan === 'lifetime') {
-        nextExpiresAt = '∞';
-      } else {
-        const extendDays = days || 0;
-        const currentExpiry =
-          user.subscription.expiresAt !== '-' && user.subscription.expiresAt !== '∞'
-            ? new Date(user.subscription.expiresAt)
-            : new Date();
-        const baseDate = currentExpiry.getTime() > Date.now() ? currentExpiry : new Date();
-        baseDate.setDate(baseDate.getDate() + extendDays);
-        nextExpiresAt = baseDate.toISOString();
-        if (!nextPlan || nextPlan === 'none') {
-          nextPlan = normalizePlanName(user.subscription.plan, extendDays) || 'month';
-        }
-      }
-
-      const nextSubscription = {
-        plan: nextPlan === 'none' ? user.subscription.plan : nextPlan,
-        status: 'active',
-        expiresAt: nextExpiresAt,
-      };
-
-      const saved = localStorage.getItem('rainclient_users');
-      const users = saved ? JSON.parse(saved) : {};
-      const updatedUser = {
-        ...users[user.username],
-        subscription: nextSubscription,
-      };
-      users[user.username] = updatedUser;
-      localStorage.setItem('rainclient_users', JSON.stringify(users));
-      setUser(updatedUser);
-
-      await update(ref(database, `users/${user.username}`), {
-        key,
-        subscription: nextSubscription,
-        activatedAt: new Date().toISOString(),
-      });
-      await update(ref(database, `keys/${key}`), {
-        isUsed: true,
-        used: true,
-        activated: true,
-        activatedBy: user.username,
-        activatedAt: new Date().toISOString(),
-      });
-
-      const successMessage =
-        plan === 'lifetime'
-          ? 'Ключ имеется: активирована подписка lifetime'
-          : `Ключ имеется: добавлено ${days} дн. к подписке`;
-      return { ok: true, message: successMessage };
-    } catch (error: any) {
-      return { ok: false, message: error?.message || 'Ошибка при проверке ключа' };
-    }
+    return activateSubscriptionKeyForUser(user.username, key);
   };
 
   const downloadLoader = () => {
@@ -649,13 +720,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const spinRoulette = (days: number) => {
     if (!user) return;
-    const saved = localStorage.getItem('rainclient_users');
-    const users = saved ? JSON.parse(saved) : {};
 
     let nextSubscription = { ...user.subscription };
     if (days > 0) {
       let expiresAt = user.subscription.expiresAt;
-      if (expiresAt !== '∞') {
+      if (expiresAt !== '∞' && expiresAt !== LIFETIME_EXPIRES_AT) {
         const expDate = expiresAt !== '-' ? new Date(expiresAt) : new Date();
         if (expDate.getTime() > Date.now()) {
           expDate.setDate(expDate.getDate() + days);
@@ -672,33 +741,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
       };
     }
 
-    const updatedUser = {
+    const lastRewardAt = new Date().toISOString();
+    const rewardCount = (user.rewardCount || 0) + 1;
+    void persistUserSubscription(user.username, nextSubscription, {
+      lastRewardAt,
+      rewardCount,
+    });
+    setUser({
       ...user,
       subscription: nextSubscription,
-      lastRewardAt: new Date().toISOString(),
-      rewardCount: (user.rewardCount || 0) + 1
-    };
-    
-    users[user.username] = updatedUser;
-    localStorage.setItem('rainclient_users', JSON.stringify(users));
-    setUser(updatedUser);
-
-    import('firebase/database').then(({ ref, update }) => {
-      import('../utils/firebase').then(({ database }) => {
-        update(ref(database, `users/${user.username}`), {
-          subscription: nextSubscription,
-          lastRewardAt: updatedUser.lastRewardAt,
-          rewardCount: updatedUser.rewardCount
-        }).catch(err => console.error('Failed to update reward in firebase:', err));
-      }).catch(err => console.error('Failed to load firebase utils:', err));
-    }).catch(err => console.error('Failed to load firebase/database:', err));
+      lastRewardAt,
+      rewardCount,
+    });
   };
 
   return (
     <AppContext.Provider value={{
       lang, setLang, t, user, login, register, logout, updateEmail,
       page, setPage, showAuth, setShowAuth,
-      showPurchase, setShowPurchase, purchaseSubscription, downloadLoader,
+      showPurchase, setShowPurchase, purchaseSubscription, completeVerifiedPayment, downloadLoader,
       applySubscriptionKey, createTwoFactorSetup, enableTwoFactor, disableTwoFactor, spinRoulette,
       syncSessionFromStorage
     }}>

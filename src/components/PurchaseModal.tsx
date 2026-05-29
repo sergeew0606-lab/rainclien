@@ -6,6 +6,7 @@ import {
   Sparkles, Rocket, ChevronRight, Tag, Percent, BadgeCheck, XCircle
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { createPendingPayment, paymentLabel, waitForPaymentVerified } from '../utils/payments';
 
 type Plan = 'month' | 'year' | 'lifetime';
 
@@ -94,7 +95,10 @@ const BASE_PRICES: Record<Plan, number> = {
 };
 
 export default function PurchaseModal() {
-  const { showPurchase, setShowPurchase, setPage, syncSessionFromStorage, t, downloadLoader, user } = useApp();
+  const {
+    showPurchase, setShowPurchase, setPage, syncSessionFromStorage,
+    completeVerifiedPayment, t, downloadLoader, user,
+  } = useApp();
   const [selectedPlan, setSelectedPlan] = useState<Plan>('lifetime');
   const [processing, setProcessing] = useState(false);
   const [success, setSuccess] = useState(false);
@@ -109,6 +113,7 @@ export default function PurchaseModal() {
   const [promoShake, setPromoShake] = useState(false);
   const [promoChecking, setPromoChecking] = useState(false);
   const [paymentLink, setPaymentLink] = useState<string | null>(null);
+  const [purchaseMessage, setPurchaseMessage] = useState('');
 
   useEffect(() => {
     if (promoError) {
@@ -135,27 +140,52 @@ export default function PurchaseModal() {
     localStorage.removeItem('pending_purchase_status');
   };
 
-  // Main tab: wait for payment in another tab
+  // Main tab: ждём webhook ЮMoney → paid в Firebase → выдаём подписку
   useEffect(() => {
     if (!checkingPayment) return;
 
-    const checkCompleted = () => {
-      if (localStorage.getItem('pending_purchase_status') === 'completed') {
+    const paymentId = localStorage.getItem('pending_payment_id');
+    if (!paymentId) return;
+
+    let cancelled = false;
+
+    const finishVerified = async () => {
+      const verified = await waitForPaymentVerified(paymentId);
+      if (cancelled) return;
+      if (!verified) {
+        setCheckingPayment(false);
+        setPaymentFailed(true);
+        return;
+      }
+
+      const result = await completeVerifiedPayment(paymentId);
+      if (cancelled) return;
+
+      if (result.ok) {
+        setPurchaseMessage(result.message);
+        localStorage.setItem('pending_purchase_status', 'completed');
         completePaymentOnThisTab();
+      } else {
+        setCheckingPayment(false);
+        setPaymentFailed(true);
       }
     };
 
     const onStorage = (e: StorageEvent) => {
-      if (e.key === 'pending_purchase_status') checkCompleted();
+      if (e.key === 'pending_purchase_status' || e.key === null) {
+        if (localStorage.getItem('pending_purchase_status') === 'completed') {
+          completePaymentOnThisTab();
+        }
+      }
     };
 
-    const interval = window.setInterval(checkCompleted, 1200);
+    void finishVerified();
     window.addEventListener('storage', onStorage);
     return () => {
-      window.clearInterval(interval);
+      cancelled = true;
       window.removeEventListener('storage', onStorage);
     };
-  }, [checkingPayment, setPage]);
+  }, [checkingPayment, completeVerifiedPayment, setPage]);
 
   // Already paid (e.g. reopened modal)
   useEffect(() => {
@@ -266,31 +296,47 @@ export default function PurchaseModal() {
     },
   ];
 
-  const handlePurchase = () => {
+  const handlePurchase = async () => {
     if (!user) return;
-    setProcessing(true);
 
-    const wallet = '4100119541070621'; // From user screenshot
+    setProcessing(true);
+    setPurchaseMessage('');
+
+    const wallet = '4100119541070621';
     const currentPlanObj = plans.find((p) => p.id === selectedPlan)!;
     const amount = getDiscountedPrice(currentPlanObj.basePrice);
 
-    localStorage.setItem('pending_purchase_plan', selectedPlan);
-    localStorage.setItem('pending_purchase_user', user.username);
-    localStorage.removeItem('pending_purchase_status');
+    try {
+      const paymentId = await createPendingPayment(user.username, selectedPlan, amount);
 
-    const returnUrl = encodeURIComponent(`${window.location.origin}${window.location.pathname}?payment=success`);
-    const failUrl = encodeURIComponent(`${window.location.origin}${window.location.pathname}?payment=fail`);
-    const paymentUrl = `https://yoomoney.ru/quickpay/confirm.xml?receiver=${wallet}&quickpay-form=shop&targets=RainClient%20Subscription%20(${selectedPlan})%20-%20${user.username}&paymentType=AC&sum=${amount}&successURL=${returnUrl}&failURL=${failUrl}`;
+      localStorage.setItem('pending_payment_id', paymentId);
+      localStorage.setItem('pending_purchase_plan', selectedPlan);
+      localStorage.setItem('pending_purchase_user', user.username);
+      localStorage.removeItem('pending_purchase_status');
 
-    setCheckingPayment(true);
-    setProcessing(false);
-    setPaymentFailed(false);
-    setSuccess(false);
-    setPaymentLink(null);
+      const returnUrl = encodeURIComponent(
+        `${window.location.origin}${window.location.pathname}?payment=success&pid=${paymentId}`
+      );
+      const failUrl = encodeURIComponent(
+        `${window.location.origin}${window.location.pathname}?payment=fail&pid=${paymentId}`
+      );
+      const label = encodeURIComponent(paymentLabel(paymentId));
+      const paymentUrl = `https://yoomoney.ru/quickpay/confirm.xml?receiver=${wallet}&quickpay-form=shop&targets=${label}&paymentType=AC&sum=${amount}&successURL=${returnUrl}&failURL=${failUrl}`;
 
-    const payWindow = window.open(paymentUrl, '_blank', 'noopener,noreferrer');
-    if (!payWindow) {
-      setPaymentLink(paymentUrl);
+      setCheckingPayment(true);
+      setPaymentFailed(false);
+      setSuccess(false);
+      setPaymentLink(null);
+
+      const payWindow = window.open(paymentUrl, '_blank', 'noopener,noreferrer');
+      if (!payWindow) {
+        setPaymentLink(paymentUrl);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Не удалось создать платёж';
+      alert(message);
+    } finally {
+      setProcessing(false);
     }
   };
 
@@ -305,6 +351,7 @@ export default function PurchaseModal() {
     setPromoError(false);
     setPromoSuccess(false);
     setPaymentLink(null);
+    setPurchaseMessage('');
   };
 
   const currentPlan = plans.find((p) => p.id === selectedPlan)!;
@@ -364,7 +411,7 @@ export default function PurchaseModal() {
                   transition={{ delay: 0.4 }}
                   className="text-text-muted text-center max-w-md mb-8"
                 >
-                  Оплата открыта в новой вкладке. После оплаты вернитесь сюда — подписка включится автоматически.
+                  Оплата в новой вкладке. После перевода дождитесь подтверждения от ЮMoney — подписка выдастся автоматически (обычно до 1–2 минут).
                 </motion.p>
 
                 {paymentLink && (
@@ -526,7 +573,7 @@ export default function PurchaseModal() {
                   transition={{ delay: 0.6 }}
                   className="text-text-muted text-center max-w-md mb-8"
                 >
-                  {t.purchase.successDesc}
+                  {purchaseMessage || t.purchase.successDesc}
                 </motion.p>
 
                 <motion.div
@@ -907,7 +954,7 @@ export default function PurchaseModal() {
                   </div>
 
                   <motion.button
-                    onClick={handlePurchase}
+                    onClick={() => void handlePurchase()}
                     disabled={processing || !user}
                     whileHover={{ scale: 1.03, boxShadow: '0 0 50px rgba(139,92,246,0.4)' }}
                     whileTap={{ scale: 0.97 }}
