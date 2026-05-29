@@ -15,10 +15,52 @@ interface PromoCode {
   label: string;
 }
 
-const PROMO_CODES: PromoCode[] = [
-  { code: 'RAINCLIENT50', discount: 50, label: '50% OFF' },
-  { code: 'WELCOME', discount: 25, label: '25% OFF' },
-];
+/** Firebase: promos/CODE = 50  или  "50|50% OFF"  или  { discount, label, ... } */
+function parsePromoFromDb(
+  raw: unknown,
+  code: string
+): { ok: true; promo: PromoCode } | { ok: false } {
+  if (raw === null || raw === undefined) return { ok: false };
+
+  if (typeof raw === 'number') {
+    if (raw <= 0 || raw > 100) return { ok: false };
+    return { ok: true, promo: { code, discount: raw, label: `-${raw}%` } };
+  }
+
+  if (typeof raw === 'string') {
+    const [discountPart, labelPart] = raw.split(/[|,]/).map((s) => s.trim());
+    const discount = Number(discountPart);
+    if (!Number.isFinite(discount) || discount <= 0 || discount > 100) return { ok: false };
+    return {
+      ok: true,
+      promo: { code, discount, label: labelPart || `-${discount}%` },
+    };
+  }
+
+  if (typeof raw === 'object') {
+    const data = raw as {
+      discount?: number;
+      label?: string;
+      active?: boolean;
+      expiresAt?: string;
+    };
+    if (data.active === false) return { ok: false };
+    if (data.expiresAt) {
+      const expiresAt = new Date(data.expiresAt);
+      if (!Number.isNaN(expiresAt.getTime()) && expiresAt.getTime() < Date.now()) {
+        return { ok: false };
+      }
+    }
+    const discount = Number(data.discount);
+    if (!Number.isFinite(discount) || discount <= 0 || discount > 100) return { ok: false };
+    return {
+      ok: true,
+      promo: { code, discount, label: data.label || `-${discount}%` },
+    };
+  }
+
+  return { ok: false };
+}
 
 const BASE_PRICES: Record<Plan, number> = {
   month: 170,
@@ -40,6 +82,7 @@ export default function PurchaseModal() {
   const [promoError, setPromoError] = useState(false);
   const [promoSuccess, setPromoSuccess] = useState(false);
   const [promoShake, setPromoShake] = useState(false);
+  const [promoChecking, setPromoChecking] = useState(false);
 
   useEffect(() => {
     if (promoError) {
@@ -91,20 +134,41 @@ export default function PurchaseModal() {
     return Math.round(base * (1 - appliedPromo.discount / 100));
   };
 
-  const handleApplyPromo = () => {
+  const handleApplyPromo = async () => {
     const trimmed = promoInput.trim();
-    if (!trimmed) return;
-    const found = PROMO_CODES.find(
-      (p) => p.code.toLowerCase() === trimmed.toLowerCase()
-    );
-    if (found) {
-      setAppliedPromo(found);
+    if (!trimmed || promoChecking) return;
+
+    setPromoChecking(true);
+    try {
+      const { ref, get, child } = await import('firebase/database');
+      const { database } = await import('../utils/firebase');
+      const codeKey = trimmed.toUpperCase();
+      const snapshot = await get(child(ref(database), `promos/${codeKey}`));
+
+      if (!snapshot.exists()) {
+        setPromoError(true);
+        setPromoSuccess(false);
+        setAppliedPromo(null);
+        return;
+      }
+
+      const parsed = parsePromoFromDb(snapshot.val(), codeKey);
+      if (!parsed.ok) {
+        setPromoError(true);
+        setPromoSuccess(false);
+        setAppliedPromo(null);
+        return;
+      }
+
+      setAppliedPromo(parsed.promo);
       setPromoError(false);
       setPromoSuccess(true);
-    } else {
+    } catch {
       setPromoError(true);
       setPromoSuccess(false);
       setAppliedPromo(null);
+    } finally {
+      setPromoChecking(false);
     }
   };
 
@@ -618,7 +682,7 @@ export default function PurchaseModal() {
                                 setPromoInput(e.target.value);
                                 setPromoError(false);
                               }}
-                              onKeyDown={(e) => e.key === 'Enter' && handleApplyPromo()}
+                              onKeyDown={(e) => e.key === 'Enter' && void handleApplyPromo()}
                               placeholder={t.purchase.promoPlaceholder}
                               disabled={!!appliedPromo}
                               className={`w-full px-4 py-3 bg-white/[0.04] border-2 rounded-xl text-white text-sm placeholder-white/30 outline-none transition-all duration-300 ${
@@ -698,13 +762,14 @@ export default function PurchaseModal() {
                           </motion.button>
                         ) : (
                           <motion.button
-                            onClick={handleApplyPromo}
-                            whileHover={{ scale: 1.05, boxShadow: '0 0 30px rgba(139,92,246,0.3)' }}
-                            whileTap={{ scale: 0.95 }}
-                            className="px-6 py-3 bg-gradient-to-r from-primary/20 to-zinc-600/20 border border-primary/30 text-primary font-semibold rounded-xl text-sm hover:from-primary/30 hover:to-zinc-600/30 transition-all flex items-center gap-2"
+                            onClick={() => void handleApplyPromo()}
+                            disabled={promoChecking}
+                            whileHover={promoChecking ? {} : { scale: 1.05, boxShadow: '0 0 30px rgba(139,92,246,0.3)' }}
+                            whileTap={promoChecking ? {} : { scale: 0.95 }}
+                            className="px-6 py-3 bg-gradient-to-r from-primary/20 to-zinc-600/20 border border-primary/30 text-primary font-semibold rounded-xl text-sm hover:from-primary/30 hover:to-zinc-600/30 transition-all flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             <Tag size={14} />
-                            {t.purchase.promoApply}
+                            {promoChecking ? '...' : t.purchase.promoApply}
                           </motion.button>
                         )}
                       </div>
