@@ -65,10 +65,14 @@ export async function waitForPaymentVerified(
 }
 
 export async function markPaymentFulfilled(paymentId: string): Promise<void> {
-  const { ref, update } = await import('firebase/database');
-  const { database } = await import('./firebase');
-  await update(ref(database, `payments/${paymentId}`), {
-    fulfilled: true,
-    fulfilledAt: new Date().toISOString(),
-  });
+  try {
+    const { ref, update } = await import('firebase/database');
+    const { database } = await import('./firebase');
+    await update(ref(database, `payments/${paymentId}`), {
+      fulfilled: true,
+      fulfilledAt: new Date().toISOString(),
+    });
+  } catch {
+    // Rules may block client writes after create — subscription still granted
+  }
 }

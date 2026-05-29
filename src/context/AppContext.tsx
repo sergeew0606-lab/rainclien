@@ -6,7 +6,6 @@ import {
   type PurchasePlan,
   getPendingPayment,
   markPaymentFulfilled,
-  waitForPaymentVerified,
 } from '../utils/payments';
 
 interface User {
@@ -51,7 +50,7 @@ interface AppContextType {
   showPurchase: boolean;
   setShowPurchase: (v: boolean) => void;
   purchaseSubscription: (plan: PurchasePlan) => Promise<void>;
-  completeVerifiedPayment: (paymentId: string) => Promise<{ ok: boolean; message: string }>;
+  fulfillPaymentAfterSuccess: (paymentId: string) => Promise<{ ok: boolean; message: string }>;
   applySubscriptionKey: (key: string) => Promise<{ ok: boolean; message: string }>;
   createTwoFactorSetup: () => Promise<{ ok: boolean; message: string; secret?: string; qrCodeUrl?: string }>;
   enableTwoFactor: (secret: string, code: string) => Promise<{ ok: boolean; message: string }>;
@@ -431,28 +430,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const completeVerifiedPayment = async (
+  /** Сразу после успешного возврата с ЮMoney — выдаём подписку без ожидания webhook */
+  const fulfillPaymentAfterSuccess = async (
     paymentId: string
   ): Promise<{ ok: boolean; message: string }> => {
     const payment = await getPendingPayment(paymentId);
-    if (!payment || payment.status !== 'paid') {
-      return {
-        ok: false,
-        message: 'Оплата не подтверждена. Дождитесь зачисления или напишите в поддержку.',
-      };
-    }
-    if (payment.fulfilled) {
+    if (payment?.fulfilled) {
       return { ok: true, message: 'Подписка уже активирована' };
     }
 
-    const result = await grantSubscriptionToUser(payment.username, payment.plan);
+    const plan = (payment?.plan ||
+      localStorage.getItem('pending_purchase_plan')) as PurchasePlan | null;
+    const username =
+      payment?.username ||
+      localStorage.getItem('pending_purchase_user') ||
+      user?.username;
+
+    if (!plan || !username) {
+      return { ok: false, message: 'Не найдены данные покупки. Войдите и попробуйте снова.' };
+    }
+
+    const result = await grantSubscriptionToUser(username, plan);
     if (result.ok) {
       await markPaymentFulfilled(paymentId);
     }
     return result;
   };
 
-  // Payment tab: only after ЮMoney webhook marked payment as paid
+  // Вкладка оплаты: ?payment=success → сразу выдача подписки
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const paymentStatus = urlParams.get('payment');
@@ -488,16 +493,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     void (async () => {
       setShowPurchase(true);
-      const verified = await waitForPaymentVerified(paymentId);
-      if (!verified) {
-        localStorage.removeItem('pending_payment_id');
-        localStorage.removeItem('pending_purchase_plan');
-        localStorage.removeItem('pending_purchase_user');
-        finishPaymentUi(false);
-        return;
-      }
-
-      const result = await completeVerifiedPayment(paymentId);
+      const result = await fulfillPaymentAfterSuccess(paymentId);
       localStorage.removeItem('pending_payment_id');
       localStorage.removeItem('pending_purchase_plan');
       localStorage.removeItem('pending_purchase_user');
@@ -759,7 +755,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     <AppContext.Provider value={{
       lang, setLang, t, user, login, register, logout, updateEmail,
       page, setPage, showAuth, setShowAuth,
-      showPurchase, setShowPurchase, purchaseSubscription, completeVerifiedPayment, downloadLoader,
+      showPurchase, setShowPurchase, purchaseSubscription, fulfillPaymentAfterSuccess, downloadLoader,
       applySubscriptionKey, createTwoFactorSetup, enableTwoFactor, disableTwoFactor, spinRoulette,
       syncSessionFromStorage
     }}>

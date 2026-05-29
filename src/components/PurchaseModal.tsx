@@ -6,7 +6,7 @@ import {
   Sparkles, Rocket, ChevronRight, Tag, Percent, BadgeCheck, XCircle
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import { createPendingPayment, paymentLabel, waitForPaymentVerified } from '../utils/payments';
+import { createPendingPayment, paymentLabel } from '../utils/payments';
 
 type Plan = 'month' | 'year' | 'lifetime';
 
@@ -97,7 +97,7 @@ const BASE_PRICES: Record<Plan, number> = {
 export default function PurchaseModal() {
   const {
     showPurchase, setShowPurchase, setPage, syncSessionFromStorage,
-    completeVerifiedPayment, t, downloadLoader, user,
+    fulfillPaymentAfterSuccess, t, downloadLoader, user,
   } = useApp();
   const [selectedPlan, setSelectedPlan] = useState<Plan>('lifetime');
   const [processing, setProcessing] = useState(false);
@@ -140,7 +140,7 @@ export default function PurchaseModal() {
     localStorage.removeItem('pending_purchase_status');
   };
 
-  // Main tab: ждём webhook ЮMoney → paid в Firebase → выдаём подписку
+  // Главная вкладка: ждём успех из вкладки оплаты или выдаём сами по ?payment=success
   useEffect(() => {
     if (!checkingPayment) return;
 
@@ -149,43 +149,48 @@ export default function PurchaseModal() {
 
     let cancelled = false;
 
-    const finishVerified = async () => {
-      const verified = await waitForPaymentVerified(paymentId);
-      if (cancelled) return;
-      if (!verified) {
-        setCheckingPayment(false);
-        setPaymentFailed(true);
+    const tryFulfill = async () => {
+      if (localStorage.getItem('pending_purchase_status') === 'completed') {
+        completePaymentOnThisTab();
         return;
       }
 
-      const result = await completeVerifiedPayment(paymentId);
-      if (cancelled) return;
-
-      if (result.ok) {
-        setPurchaseMessage(result.message);
-        localStorage.setItem('pending_purchase_status', 'completed');
-        completePaymentOnThisTab();
-      } else {
-        setCheckingPayment(false);
-        setPaymentFailed(true);
-      }
-    };
-
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === 'pending_purchase_status' || e.key === null) {
-        if (localStorage.getItem('pending_purchase_status') === 'completed') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('payment') === 'success') {
+        const result = await fulfillPaymentAfterSuccess(paymentId);
+        if (cancelled) return;
+        if (result.ok) {
+          setPurchaseMessage(result.message);
+          localStorage.setItem('pending_purchase_status', 'completed');
+          localStorage.removeItem('pending_payment_id');
+          localStorage.removeItem('pending_purchase_plan');
+          localStorage.removeItem('pending_purchase_user');
+          window.history.replaceState({}, document.title, window.location.pathname);
           completePaymentOnThisTab();
         }
       }
     };
 
-    void finishVerified();
+    const onStorage = () => {
+      if (localStorage.getItem('pending_purchase_status') === 'completed') {
+        completePaymentOnThisTab();
+      }
+    };
+
+    void tryFulfill();
+    const interval = window.setInterval(() => {
+      if (localStorage.getItem('pending_purchase_status') === 'completed') {
+        completePaymentOnThisTab();
+      }
+    }, 800);
+
     window.addEventListener('storage', onStorage);
     return () => {
       cancelled = true;
+      window.clearInterval(interval);
       window.removeEventListener('storage', onStorage);
     };
-  }, [checkingPayment, completeVerifiedPayment, setPage]);
+  }, [checkingPayment, fulfillPaymentAfterSuccess, setPage]);
 
   // Already paid (e.g. reopened modal)
   useEffect(() => {
@@ -411,7 +416,7 @@ export default function PurchaseModal() {
                   transition={{ delay: 0.4 }}
                   className="text-text-muted text-center max-w-md mb-8"
                 >
-                  Оплата в новой вкладке. После перевода дождитесь подтверждения от ЮMoney — подписка выдастся автоматически (обычно до 1–2 минут).
+                  Оплата в новой вкладке. После успешной оплаты вернитесь сюда — подписка включится сразу.
                 </motion.p>
 
                 {paymentLink && (
