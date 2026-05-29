@@ -51,6 +51,7 @@ interface AppContextType {
   disableTwoFactor: () => Promise<{ ok: boolean; message: string }>;
   downloadLoader: () => void;
   spinRoulette: (days: number) => void;
+  syncSessionFromStorage: () => void;
 }
 
 const AppContext = createContext<AppContextType | null>(null);
@@ -164,6 +165,31 @@ function inferPlanFromDays(days: number): string {
   return 'week';
 }
 
+type PurchasePlan = 'month' | 'year' | 'lifetime';
+
+function buildSubscriptionForPurchase(
+  plan: PurchasePlan,
+  current: User['subscription']
+): User['subscription'] {
+  if (plan === 'lifetime') {
+    return { plan: 'lifetime', status: 'active', expiresAt: '∞' };
+  }
+
+  const currentExpiry = current.expiresAt !== '-' && current.expiresAt !== '∞'
+    ? new Date(current.expiresAt)
+    : new Date();
+  const isExpired = currentExpiry.getTime() < Date.now();
+  const baseDate = isExpired ? new Date() : currentExpiry;
+
+  if (plan === 'month') {
+    baseDate.setDate(baseDate.getDate() + 30);
+  } else if (plan === 'year') {
+    baseDate.setDate(baseDate.getDate() + 180);
+  }
+
+  return { plan, status: 'active', expiresAt: baseDate.toISOString() };
+}
+
 function normalizeSubscription(firebaseData?: any): User['subscription'] {
   const subData = firebaseData?.subscription || {};
   const durationDays = readDurationDays(subData) || readDurationDays(firebaseData);
@@ -228,32 +254,123 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, [user]);
 
-  // Handle returning from payment
+  const syncSessionFromStorage = () => {
+    const saved = localStorage.getItem('rainclient_user');
+    if (!saved) return;
+    const parsed = JSON.parse(saved);
+    setUser({
+      ...parsed,
+      subscription: normalizeSubscription(parsed.subscription),
+    });
+  };
+
+  const grantSubscriptionToUser = async (username: string, plan: PurchasePlan): Promise<boolean> => {
+    const saved = localStorage.getItem('rainclient_users');
+    const users = saved ? JSON.parse(saved) : {};
+    const account = users[username];
+    if (!account) return false;
+
+    const subscription = buildSubscriptionForPurchase(
+      plan,
+      account.subscription || { plan: 'none', status: 'none', expiresAt: '-' }
+    );
+    const updatedUser = { ...account, subscription };
+    users[username] = updatedUser;
+    localStorage.setItem('rainclient_users', JSON.stringify(users));
+
+    const sessionRaw = localStorage.getItem('rainclient_user');
+    if (sessionRaw) {
+      const session = JSON.parse(sessionRaw);
+      if (session.username === username) {
+        localStorage.setItem('rainclient_user', JSON.stringify(updatedUser));
+        setUser({ ...updatedUser, subscription });
+      }
+    }
+
+    try {
+      const { ref, update } = await import('firebase/database');
+      const { database } = await import('../utils/firebase');
+      await update(ref(database, `users/${username}`), {
+        subscription,
+        paidAt: new Date().toISOString(),
+        lastPurchasePlan: plan,
+      });
+    } catch (err) {
+      console.error('Failed to sync subscription to Firebase:', err);
+    }
+
+    return true;
+  };
+
+  // Payment tab returns here — activate and notify the main tab
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.get('payment') === 'success') {
-      const pendingPlan = localStorage.getItem('pending_purchase_plan') as 'month' | 'year' | 'lifetime';
-      if (pendingPlan && user) {
-        setTimeout(() => {
-          void purchaseSubscription(pendingPlan).finally(() => {
-            localStorage.removeItem('pending_purchase_plan');
-            localStorage.removeItem('pending_purchase_user');
-            setPage('profile');
-            setShowPurchase(true);
-            window.history.replaceState({}, document.title, window.location.pathname);
-          });
-        }, 500);
+    const paymentStatus = urlParams.get('payment');
+    if (!paymentStatus) return;
+
+    const finishPaymentUi = (completed: boolean) => {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      if (completed) {
+        localStorage.setItem('pending_purchase_status', 'completed');
+        setPage('profile');
+      } else {
+        localStorage.removeItem('pending_purchase_status');
       }
-    } else if (urlParams.get('payment') === 'fail') {
-      // Payment failed - show purchase modal with failed state
-      setTimeout(() => {
-        localStorage.removeItem('pending_purchase_plan');
-        setShowPurchase(true);
-        // Clean up URL
-        window.history.replaceState({}, document.title, window.location.pathname);
-      }, 500);
+      setShowPurchase(true);
+    };
+
+    if (paymentStatus === 'fail') {
+      localStorage.removeItem('pending_purchase_plan');
+      localStorage.removeItem('pending_purchase_user');
+      finishPaymentUi(false);
+      return;
     }
-  }, [user]);
+
+    if (paymentStatus !== 'success') return;
+
+    const pendingPlan = localStorage.getItem('pending_purchase_plan') as PurchasePlan | null;
+    if (!pendingPlan) {
+      finishPaymentUi(false);
+      return;
+    }
+
+    const savedUser = localStorage.getItem('rainclient_user');
+    const parsedUser = savedUser ? JSON.parse(savedUser) : null;
+    const username =
+      localStorage.getItem('pending_purchase_user') ||
+      parsedUser?.username ||
+      user?.username;
+
+    if (!username) {
+      finishPaymentUi(false);
+      return;
+    }
+
+    void (async () => {
+      const ok = await grantSubscriptionToUser(username, pendingPlan);
+      localStorage.removeItem('pending_purchase_plan');
+      localStorage.removeItem('pending_purchase_user');
+      finishPaymentUi(ok);
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- run once when returning from payment URL
+  }, []);
+
+  // Main tab: subscription activated in the payment tab
+  useEffect(() => {
+    const onCompleted = () => {
+      if (localStorage.getItem('pending_purchase_status') !== 'completed') return;
+      syncSessionFromStorage();
+      setPage('profile');
+      setShowPurchase(true);
+    };
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'pending_purchase_status' && e.newValue === 'completed') onCompleted();
+    };
+
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   const login = (username: string, _password: string, firebaseData?: any): boolean => {
     const saved = localStorage.getItem('rainclient_users');
@@ -335,48 +452,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return true;
   };
 
-  const purchaseSubscription = async (plan: 'month' | 'year' | 'lifetime') => {
+  const purchaseSubscription = async (plan: PurchasePlan) => {
     if (!user) return;
-    const saved = localStorage.getItem('rainclient_users');
-    const users = saved ? JSON.parse(saved) : {};
-
-    let expiresAt: string;
-
-    if (plan === 'lifetime') {
-      expiresAt = '∞';
-    } else {
-      const currentExpiry = user.subscription.expiresAt !== '-'
-        && user.subscription.expiresAt !== '∞'
-        ? new Date(user.subscription.expiresAt)
-        : new Date();
-      const isExpired = currentExpiry.getTime() < Date.now();
-      const baseDate = isExpired ? new Date() : currentExpiry;
-
-      if (plan === 'month') {
-        baseDate.setDate(baseDate.getDate() + 30);
-      } else if (plan === 'year') {
-        baseDate.setDate(baseDate.getDate() + 180);
-      }
-      expiresAt = baseDate.toISOString();
-    }
-
-    const subscription = { plan, status: 'active', expiresAt };
-    const updatedUser = { ...users[user.username], subscription };
-    users[user.username] = updatedUser;
-    localStorage.setItem('rainclient_users', JSON.stringify(users));
-    setUser(updatedUser);
-
-    try {
-      const { ref, update } = await import('firebase/database');
-      const { database } = await import('../utils/firebase');
-      await update(ref(database, `users/${user.username}`), {
-        subscription,
-        paidAt: new Date().toISOString(),
-        lastPurchasePlan: plan,
-      });
-    } catch (err) {
-      console.error('Failed to sync subscription to Firebase:', err);
-    }
+    await grantSubscriptionToUser(user.username, plan);
   };
 
   const applySubscriptionKey = async (keyRaw: string): Promise<{ ok: boolean; message: string }> => {
@@ -621,7 +699,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       lang, setLang, t, user, login, register, logout, updateEmail,
       page, setPage, showAuth, setShowAuth,
       showPurchase, setShowPurchase, purchaseSubscription, downloadLoader,
-      applySubscriptionKey, createTwoFactorSetup, enableTwoFactor, disableTwoFactor, spinRoulette
+      applySubscriptionKey, createTwoFactorSetup, enableTwoFactor, disableTwoFactor, spinRoulette,
+      syncSessionFromStorage
     }}>
       {children}
     </AppContext.Provider>

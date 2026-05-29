@@ -94,7 +94,7 @@ const BASE_PRICES: Record<Plan, number> = {
 };
 
 export default function PurchaseModal() {
-  const { showPurchase, setShowPurchase, t, downloadLoader, user } = useApp();
+  const { showPurchase, setShowPurchase, setPage, syncSessionFromStorage, t, downloadLoader, user } = useApp();
   const [selectedPlan, setSelectedPlan] = useState<Plan>('lifetime');
   const [processing, setProcessing] = useState(false);
   const [success, setSuccess] = useState(false);
@@ -108,6 +108,7 @@ export default function PurchaseModal() {
   const [promoSuccess, setPromoSuccess] = useState(false);
   const [promoShake, setPromoShake] = useState(false);
   const [promoChecking, setPromoChecking] = useState(false);
+  const [paymentLink, setPaymentLink] = useState<string | null>(null);
 
   useEffect(() => {
     if (promoError) {
@@ -124,33 +125,45 @@ export default function PurchaseModal() {
     }
   }, [promoSuccess]);
 
-  // Check payment status when modal opens
+  const completePaymentOnThisTab = () => {
+    syncSessionFromStorage();
+    setCheckingPayment(false);
+    setPaymentFailed(false);
+    setSuccess(true);
+    setPaymentLink(null);
+    setPage('profile');
+    localStorage.removeItem('pending_purchase_status');
+  };
+
+  // Main tab: wait for payment in another tab
   useEffect(() => {
-    if (showPurchase) {
-      const urlParams = new URLSearchParams(window.location.search);
-      const paymentStatus = urlParams.get('payment');
-      
-      if (paymentStatus === 'checking') {
-        setCheckingPayment(true);
-        setPaymentFailed(false);
-        setSuccess(false);
-        // Clean up URL
-        window.history.replaceState({}, document.title, window.location.pathname);
-      } else if (paymentStatus === 'fail') {
-        setCheckingPayment(false);
-        setPaymentFailed(true);
-        setSuccess(false);
-        // Clean up URL
-        window.history.replaceState({}, document.title, window.location.pathname);
-      } else if (paymentStatus === 'success') {
-        setCheckingPayment(false);
-        setPaymentFailed(false);
-        setSuccess(true);
-        // Clean up URL
-        window.history.replaceState({}, document.title, window.location.pathname);
+    if (!checkingPayment) return;
+
+    const checkCompleted = () => {
+      if (localStorage.getItem('pending_purchase_status') === 'completed') {
+        completePaymentOnThisTab();
       }
+    };
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'pending_purchase_status') checkCompleted();
+    };
+
+    const interval = window.setInterval(checkCompleted, 1200);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, [checkingPayment, setPage]);
+
+  // Already paid (e.g. reopened modal)
+  useEffect(() => {
+    if (!showPurchase) return;
+    if (localStorage.getItem('pending_purchase_status') === 'completed') {
+      completePaymentOnThisTab();
     }
-  }, [showPurchase]);
+  }, [showPurchase, setPage]);
 
   if (!showPurchase) return null;
 
@@ -261,22 +274,24 @@ export default function PurchaseModal() {
     const currentPlanObj = plans.find((p) => p.id === selectedPlan)!;
     const amount = getDiscountedPrice(currentPlanObj.basePrice);
 
-    // Save pending purchase info (used after return from YooMoney)
     localStorage.setItem('pending_purchase_plan', selectedPlan);
     localStorage.setItem('pending_purchase_user', user.username);
+    localStorage.removeItem('pending_purchase_status');
 
-    // Show checking payment screen first
+    const returnUrl = encodeURIComponent(`${window.location.origin}${window.location.pathname}?payment=success`);
+    const failUrl = encodeURIComponent(`${window.location.origin}${window.location.pathname}?payment=fail`);
+    const paymentUrl = `https://yoomoney.ru/quickpay/confirm.xml?receiver=${wallet}&quickpay-form=shop&targets=RainClient%20Subscription%20(${selectedPlan})%20-%20${user.username}&paymentType=AC&sum=${amount}&successURL=${returnUrl}&failURL=${failUrl}`;
+
     setCheckingPayment(true);
     setProcessing(false);
+    setPaymentFailed(false);
+    setSuccess(false);
+    setPaymentLink(null);
 
-    // Redirect to YooMoney after a short delay
-    setTimeout(() => {
-      const returnUrl = encodeURIComponent(window.location.origin + '?payment=success');
-      const failUrl = encodeURIComponent(window.location.origin + '?payment=fail');
-      const paymentUrl = `https://yoomoney.ru/quickpay/confirm.xml?receiver=${wallet}&quickpay-form=shop&targets=RainClient%20Subscription%20(${selectedPlan})%20-%20${user.username}&paymentType=AC&sum=${amount}&successURL=${returnUrl}&failURL=${failUrl}`;
-
-      window.location.href = paymentUrl;
-    }, 1500);
+    const payWindow = window.open(paymentUrl, '_blank', 'noopener,noreferrer');
+    if (!payWindow) {
+      setPaymentLink(paymentUrl);
+    }
   };
 
   const handleClose = () => {
@@ -289,6 +304,7 @@ export default function PurchaseModal() {
     setPromoInput('');
     setPromoError(false);
     setPromoSuccess(false);
+    setPaymentLink(null);
   };
 
   const currentPlan = plans.find((p) => p.id === selectedPlan)!;
@@ -348,8 +364,21 @@ export default function PurchaseModal() {
                   transition={{ delay: 0.4 }}
                   className="text-text-muted text-center max-w-md mb-8"
                 >
-                  Пожалуйста, подождите. Мы проверяем статус вашей оплаты...
+                  Оплата открыта в новой вкладке. После оплаты вернитесь сюда — подписка включится автоматически.
                 </motion.p>
+
+                {paymentLink && (
+                  <motion.a
+                    href={paymentLink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mb-6 px-6 py-3 rounded-xl bg-primary/20 border border-primary/40 text-primary text-sm font-semibold hover:bg-primary/30 transition-colors"
+                  >
+                    Открыть оплату вручную
+                  </motion.a>
+                )}
 
                 <motion.div
                   initial={{ opacity: 0 }}
@@ -362,7 +391,7 @@ export default function PurchaseModal() {
                     transition={{ duration: 1.5, repeat: Infinity }}
                     className="w-2 h-2 bg-blue-400 rounded-full"
                   />
-                  <span>Обработка платежа</span>
+                  <span>Ожидаем оплату…</span>
                 </motion.div>
               </motion.div>
             </div>
