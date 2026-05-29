@@ -1,0 +1,28 @@
+{
+  "rules": {
+    "users": {
+      "$username": {
+        ".read": true,
+        ".write": true
+      }
+    },
+    "keys": {
+      "$key": {
+        ".read": true,
+        ".write": true
+      }
+    },
+    "promos": {
+      "$code": {
+        ".read": true,
+        ".write": false
+      }
+    },
+    "payments": {
+      "$id": {
+        ".read": true,
+        ".write": "!data.exists() && newData.child('status').val() === 'pending'"
+      }
+    }
+  }
+}
