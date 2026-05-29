@@ -261,8 +261,9 @@ export default function PurchaseModal() {
     const currentPlanObj = plans.find((p) => p.id === selectedPlan)!;
     const amount = getDiscountedPrice(currentPlanObj.basePrice);
 
-    // Save pending purchase info
+    // Save pending purchase info (used after return from YooMoney)
     localStorage.setItem('pending_purchase_plan', selectedPlan);
+    localStorage.setItem('pending_purchase_user', user.username);
 
     // Show checking payment screen first
     setCheckingPayment(true);

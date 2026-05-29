@@ -44,7 +44,7 @@ interface AppContextType {
   setShowAuth: (v: 'login' | 'register' | null) => void;
   showPurchase: boolean;
   setShowPurchase: (v: boolean) => void;
-  purchaseSubscription: (plan: 'month' | 'year' | 'lifetime') => void;
+  purchaseSubscription: (plan: 'month' | 'year' | 'lifetime') => Promise<void>;
   applySubscriptionKey: (key: string) => Promise<{ ok: boolean; message: string }>;
   createTwoFactorSetup: () => Promise<{ ok: boolean; message: string; secret?: string; qrCodeUrl?: string }>;
   enableTwoFactor: (secret: string, code: string) => Promise<{ ok: boolean; message: string }>;
@@ -234,16 +234,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (urlParams.get('payment') === 'success') {
       const pendingPlan = localStorage.getItem('pending_purchase_plan') as 'month' | 'year' | 'lifetime';
       if (pendingPlan && user) {
-        // We defer it slightly to ensure everything is loaded
         setTimeout(() => {
-          // NOTE: Real payment verification requires backend server
-          // For now, we just show success screen without activating subscription
-          // To enable real payments, you need to implement server-side payment verification
-          localStorage.removeItem('pending_purchase_plan');
-          setPage('profile');
-          setShowPurchase(true);
-          // Clean up URL
-          window.history.replaceState({}, document.title, window.location.pathname);
+          void purchaseSubscription(pendingPlan).finally(() => {
+            localStorage.removeItem('pending_purchase_plan');
+            localStorage.removeItem('pending_purchase_user');
+            setPage('profile');
+            setShowPurchase(true);
+            window.history.replaceState({}, document.title, window.location.pathname);
+          });
         }, 500);
       }
     } else if (urlParams.get('payment') === 'fail') {
@@ -337,40 +335,48 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return true;
   };
 
-  const purchaseSubscription = (plan: 'month' | 'year' | 'lifetime') => {
+  const purchaseSubscription = async (plan: 'month' | 'year' | 'lifetime') => {
     if (!user) return;
     const saved = localStorage.getItem('rainclient_users');
     const users = saved ? JSON.parse(saved) : {};
-    
+
     let expiresAt: string;
-    
+
     if (plan === 'lifetime') {
       expiresAt = '∞';
     } else {
-      const currentExpiry = user.subscription.expiresAt !== '-' 
+      const currentExpiry = user.subscription.expiresAt !== '-'
         && user.subscription.expiresAt !== '∞'
-        ? new Date(user.subscription.expiresAt) 
+        ? new Date(user.subscription.expiresAt)
         : new Date();
       const isExpired = currentExpiry.getTime() < Date.now();
       const baseDate = isExpired ? new Date() : currentExpiry;
-      
+
       if (plan === 'month') {
         baseDate.setDate(baseDate.getDate() + 30);
-        expiresAt = baseDate.toISOString();
       } else if (plan === 'year') {
-        baseDate.setDate(baseDate.getDate() + 365);
-        expiresAt = baseDate.toISOString();
-      } else {
         baseDate.setDate(baseDate.getDate() + 180);
-        expiresAt = baseDate.toISOString();
       }
+      expiresAt = baseDate.toISOString();
     }
-    
+
     const subscription = { plan, status: 'active', expiresAt };
     const updatedUser = { ...users[user.username], subscription };
     users[user.username] = updatedUser;
     localStorage.setItem('rainclient_users', JSON.stringify(users));
     setUser(updatedUser);
+
+    try {
+      const { ref, update } = await import('firebase/database');
+      const { database } = await import('../utils/firebase');
+      await update(ref(database, `users/${user.username}`), {
+        subscription,
+        paidAt: new Date().toISOString(),
+        lastPurchasePlan: plan,
+      });
+    } catch (err) {
+      console.error('Failed to sync subscription to Firebase:', err);
+    }
   };
 
   const applySubscriptionKey = async (keyRaw: string): Promise<{ ok: boolean; message: string }> => {
